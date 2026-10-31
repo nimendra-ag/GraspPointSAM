@@ -1,0 +1,3 @@
+[submodule "third_party/torkit3d"]
+	path = third_party/torkit3d
+	url = https://github.com/Jiayuan-Gu/torkit3d.git

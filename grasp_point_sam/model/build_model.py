@@ -9,7 +9,7 @@ import timm
 from omegaconf import DictConfig
 
 from .pc_encoder import PointCloudEncoder, PatchEmbed
-from .prompt_encoder import MaskEncoder
+from .prompt_encoder import PointEncoder, MaskEncoder
 from .mask_decoder import MaskDecoder
 from .transformer import TwoWayTransformer
 from .grasp_decoder import GraspDecoder3D
@@ -51,6 +51,9 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         embed_dim   = m.pc_encoder.embed_dim,
     )
 
+    # ── PointEncoder ─────────────────────────────────────────────────────
+    point_encoder = PointEncoder(embed_dim=m.point_encoder.embed_dim)
+
     # ── MaskEncoder ──────────────────────────────────────────────────────
     mask_encoder = MaskEncoder(embed_dim=m.mask_encoder.embed_dim)
 
@@ -58,10 +61,10 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
     mask_decoder = MaskDecoder(
         transformer_dim = m.mask_decoder.transformer_dim,
         transformer     = TwoWayTransformer(
-            depth          = m.mask_decoder.depth,
-            embedding_dim  = m.mask_decoder.transformer_dim,
-            num_heads      = m.mask_decoder.num_heads,
-            mlp_dim        = m.mask_decoder.mlp_dim,
+            depth         = m.mask_decoder.depth,
+            embedding_dim = m.mask_decoder.transformer_dim,
+            num_heads     = m.mask_decoder.num_heads,
+            mlp_dim       = m.mask_decoder.mlp_dim,
         ),
     )
 
@@ -78,9 +81,10 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         num_grasp_rot_tokens = m.grasp_decoder.num_grasp_rot_tokens,
     )
 
-    # ── Assemble GraspPointSAM ───────────────────────────────────────────
+    # Assemble GraspPointSAM 
     model = GraspPointSAM(
         pc_encoder       = pc_encoder,
+        point_encoder    = point_encoder,
         mask_encoder     = mask_encoder,
         mask_decoder     = mask_decoder,
         grasp_decoder    = grasp_decoder,
@@ -88,10 +92,10 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         joint_mask_grasp = m.joint_mask_grasp,
     )
 
-    # ── Load pretrained PointSAM weights ────────────────────────────────
+    # Load pretrained PointSAM weights 
     model.load_pretrained_pointsam(m.pretrained_ckpt)
 
-    # ── Freeze encoder if specified ──────────────────────────────────────
+    # Freeze encoder if specified 
     if m.freeze_encoder:
         model.freeze_encoder()
 

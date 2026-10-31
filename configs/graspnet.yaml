@@ -1,0 +1,36 @@
+model:
+  pretrained_ckpt: "pretrained/pointsam/model.safetensors"
+  freeze_encoder: true
+  joint_mask_grasp: true
+
+  patch_embed:              # ← must be indented under model
+    in_channels: 6
+    out_channels: 512
+    num_patches: 512
+    patch_size: 64
+
+  transformer:
+    model_name: "eva02_large_patch14_448"
+    pretrained: false
+
+  pc_encoder:
+    embed_dim: 256
+
+  mask_encoder:
+    embed_dim: 256
+
+  mask_decoder:
+    transformer_dim: 256
+    depth: 2
+    num_heads: 8
+    mlp_dim: 2048
+
+  grasp_decoder:
+    transformer_dim: 256
+    depth: 2
+    num_heads: 8
+    mlp_dim: 2048
+    num_grasp_rot_tokens: 6
+    joint_mask_grasp: true
+
+  prompt_iters: 3

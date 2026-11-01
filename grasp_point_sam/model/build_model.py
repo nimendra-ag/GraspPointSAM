@@ -38,26 +38,26 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         patch_size   = m.patch_embed.patch_size,
     )
 
-    # ── EVA-02 transformer backbone ──────────────────────────────────────
+    # EVA-02 transformer backbone 
     transformer_backbone = timm.create_model(
         m.transformer.model_name,
         pretrained=m.transformer.pretrained,
     )
 
-    # ── PointCloudEncoder ────────────────────────────────────────────────
+    # PointCloudEncoder
     pc_encoder = PointCloudEncoder(
         patch_embed = patch_embed,
         transformer = transformer_backbone,
         embed_dim   = m.pc_encoder.embed_dim,
     )
 
-    # ── PointEncoder ─────────────────────────────────────────────────────
+    # PointEncoder 
     point_encoder = PointEncoder(embed_dim=m.point_encoder.embed_dim)
 
-    # ── MaskEncoder ──────────────────────────────────────────────────────
+    # MaskEncoder
     mask_encoder = MaskEncoder(embed_dim=m.mask_encoder.embed_dim)
 
-    # ── MaskDecoder (PointSAM original) ──────────────────────────────────
+    # MaskDecoder (PointSAM original)
     mask_decoder = MaskDecoder(
         transformer_dim = m.mask_decoder.transformer_dim,
         transformer     = TwoWayTransformer(

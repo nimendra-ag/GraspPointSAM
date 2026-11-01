@@ -1,4 +1,3 @@
-# grasp_point_sam/model/build_model.py
 """
 Factory function that builds GraspPointSAM from a config file.
 Single place where all components are wired together.
@@ -30,7 +29,7 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
 
     m = cfg.model  # shorthand
 
-    # ── PatchEmbed ───────────────────────────────────────────────────────
+    # PatchEmbed 
     patch_embed = PatchEmbed(
         in_channels  = m.patch_embed.in_channels,
         out_channels = m.patch_embed.out_channels,
@@ -68,7 +67,7 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         ),
     )
 
-    # ── GraspDecoder3D (new) ─────────────────────────────────────────────
+    # GraspDecoder3D
     grasp_decoder = GraspDecoder3D(
         transformer = TwoWayTransformer(
             depth         = m.grasp_decoder.depth,
@@ -83,12 +82,12 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
 
     # Assemble GraspPointSAM 
     model = GraspPointSAM(
-        pc_encoder       = pc_encoder,
-        point_encoder    = point_encoder,
-        mask_encoder     = mask_encoder,
-        mask_decoder     = mask_decoder,
-        grasp_decoder    = grasp_decoder,
-        prompt_iters     = m.prompt_iters,
+        pc_encoder = pc_encoder,
+        point_encoder = point_encoder,
+        mask_encoder = mask_encoder,
+        mask_decoder = mask_decoder,
+        grasp_decoder = grasp_decoder,
+        prompt_iters = m.prompt_iters,
         joint_mask_grasp = m.joint_mask_grasp,
     )
 

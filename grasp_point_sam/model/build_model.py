@@ -31,10 +31,10 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
 
     # PatchEmbed 
     patch_embed = PatchEmbed(
-        in_channels  = m.patch_embed.in_channels,
+        in_channels = m.patch_embed.in_channels,
         out_channels = m.patch_embed.out_channels,
-        num_patches  = m.patch_embed.num_patches,
-        patch_size   = m.patch_embed.patch_size,
+        num_patches = m.patch_embed.num_patches,
+        patch_size = m.patch_embed.patch_size,
     )
 
     # EVA-02 transformer backbone 
@@ -47,7 +47,7 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
     pc_encoder = PointCloudEncoder(
         patch_embed = patch_embed,
         transformer = transformer_backbone,
-        embed_dim   = m.pc_encoder.embed_dim,
+        embed_dim = m.pc_encoder.embed_dim,
     )
 
     # PointEncoder 
@@ -59,24 +59,24 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
     # MaskDecoder (PointSAM original)
     mask_decoder = MaskDecoder(
         transformer_dim = m.mask_decoder.transformer_dim,
-        transformer     = TwoWayTransformer(
-            depth         = m.mask_decoder.depth,
+        transformer = TwoWayTransformer(
+            depth = m.mask_decoder.depth,
             embedding_dim = m.mask_decoder.transformer_dim,
-            num_heads     = m.mask_decoder.num_heads,
-            mlp_dim       = m.mask_decoder.mlp_dim,
+            num_heads = m.mask_decoder.num_heads,
+            mlp_dim = m.mask_decoder.mlp_dim,
         ),
     )
 
     # GraspDecoder3D
     grasp_decoder = GraspDecoder3D(
         transformer = TwoWayTransformer(
-            depth         = m.grasp_decoder.depth,
+            depth = m.grasp_decoder.depth,
             embedding_dim = m.grasp_decoder.transformer_dim,
-            num_heads     = m.grasp_decoder.num_heads,
-            mlp_dim       = m.grasp_decoder.mlp_dim,
+            num_heads = m.grasp_decoder.num_heads,
+            mlp_dim = m.grasp_decoder.mlp_dim,
         ),
-        transformer_dim      = m.grasp_decoder.transformer_dim,
-        joint_mask_grasp     = m.grasp_decoder.joint_mask_grasp,
+        transformer_dim = m.grasp_decoder.transformer_dim,
+        joint_mask_grasp = m.grasp_decoder.joint_mask_grasp,
         num_grasp_rot_tokens = m.grasp_decoder.num_grasp_rot_tokens,
     )
 

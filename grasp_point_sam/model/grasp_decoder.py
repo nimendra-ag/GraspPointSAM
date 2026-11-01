@@ -53,11 +53,11 @@ class GraspPredictions:
         IoU predictions for mask quality estimation.
         Only populated when joint_mask_grasp=True.
     """
-    grasp_quality:  torch.Tensor           # [B*M, N]
-    grasp_rotation: torch.Tensor           # [B*M, N, 6]
-    grasp_width:    torch.Tensor           # [B*M, N, 1]
-    masks:          Optional[torch.Tensor] # [B*M, N] or None
-    iou_preds:      Optional[torch.Tensor] # [B*M, num_mask_tokens] or None
+    grasp_quality: torch.Tensor     # [B*M, N]
+    grasp_rotation: torch.Tens      # [B*M, N, 6]
+    grasp_width: torch.Tensor       # [B*M, N, 1]
+    masks: Optional[torch.Tensor]   # [B*M, N] or None
+    iou_preds: Optional[torch.Tensor] # [B*M, num_mask_tokens] or None
 
 
 # Small MLP used for per-point prediction heads
@@ -81,7 +81,7 @@ class GraspMLP(nn.Module):
     """
     def __init__(
         self,
-        input_dim:  int,
+        input_dim: int,
         hidden_dim: int,
         output_dim: int,
         num_layers: int = 3,
@@ -130,8 +130,8 @@ class GraspDecoder3D(nn.Module):
     4. OUTPUT: Return GraspPredictions dataclass with all predictions.
 
     Args:
-        transformer      : TwoWayTransformer instance (from PointSAM, reused)
-        transformer_dim  : embedding dimension, must match encoder output (256)
+        transformer : TwoWayTransformer instance (from PointSAM, reused)
+        transformer_dim : embedding dimension, must match encoder output (256)
         joint_mask_grasp : if True, also predict segmentation masks
         num_grasp_rot_tokens : number of tokens for rotation prediction.
                                We use 6 tokens (one per rotation output dimension)
@@ -143,39 +143,39 @@ class GraspDecoder3D(nn.Module):
 
     def __init__(
         self,
-        transformer:           nn.Module,
-        transformer_dim:       int  = 256,
-        joint_mask_grasp:      bool = True,
-        num_grasp_rot_tokens:  int  = 6,
+        transformer: nn.Module,
+        transformer_dim: int = 256,
+        joint_mask_grasp: bool = True,
+        num_grasp_rot_tokens: int = 6,
     ):
         super().__init__()
 
-        self.transformer      = transformer
-        self.transformer_dim  = transformer_dim
+        self.transformer = transformer
+        self.transformer_dim = transformer_dim
         self.joint_mask_grasp = joint_mask_grasp
         self.num_grasp_rot_tokens = num_grasp_rot_tokens
 
-        # ── Mask tokens (from original SAM, kept for joint mode) ──────────
+        # Mask tokens (from original SAM, kept for joint mode)
         # iou_token: 1 token that predicts mask IoU quality
-        self.iou_token   = nn.Embedding(1, transformer_dim)
+        self.iou_token = nn.Embedding(1, transformer_dim)
         # mask_tokens: 4 tokens, one per mask output
         # (SAM uses 4: 1 single-mask + 3 multi-mask)
         self.mask_tokens = nn.Embedding(self.NUM_MASK_TOKENS, transformer_dim)
 
-        # ── Grasp tokens (new, learned from scratch) ───────────────────────
-        # 1 token → predicts per-point grasp quality score
+        # Grasp tokens (new, learned from scratch)
+        # 1 token -> predicts per-point grasp quality score
         self.grasp_quality_token = nn.Embedding(1, transformer_dim)
 
-        # 6 tokens → predict 6D rotation (one token per output dimension)
+        # 6 tokens -> predict 6D rotation (one token per output dimension)
         # Using multiple tokens lets each specialize in one rotation component
         self.grasp_rotation_tokens = nn.Embedding(num_grasp_rot_tokens, transformer_dim)
 
-        # 1 token → predicts per-point gripper width
+        # 1 token -> predicts per-point gripper width
         self.grasp_width_token = nn.Embedding(1, transformer_dim)
 
-        # ── MLP heads (hypernetwork pattern) ──────────────────────────────
-        # Each MLP takes a token embedding [D] → weight vector
-        # Then: weight_vector [D] dot point_features [N, D] → per-point output [N]
+        # MLP heads (hypernetwork pattern) 
+        # Each MLP takes a token embedding [D] -> weight vector
+        # Then: weight_vector [D] dot point_features [N, D] -> per-point output [N]
 
         # Quality head: outputs 1 value per point (graspability score)
         self.quality_head = GraspMLP(
@@ -205,11 +205,16 @@ class GraspDecoder3D(nn.Module):
             num_layers=3,
         )
 
-        # ── Mask output MLP heads (joint mode only) ────────────────────────
+        # Mask output MLP heads (joint mode only) 
         # Same pattern as original SAM mask decoder
         if joint_mask_grasp:
             self.mask_heads = nn.ModuleList([
-                MLP(transformer_dim, transformer_dim, transformer_dim, 3)
+                MLP(
+                    input_dim=transformer_dim,
+                    hidden_dim=transformer_dim,
+                    output_dim=transformer_dim,
+                    num_layers=3
+                )
                 for _ in range(self.NUM_MASK_TOKENS)
             ])
             self.iou_prediction_head = MLP(
@@ -219,7 +224,7 @@ class GraspDecoder3D(nn.Module):
                 num_layers=3,
             )
 
-        # ── Point feature upscaling (for per-point prediction) ─────────────
+        # Point feature upscaling (for per-point prediction) 
         # Point cloud embeddings are patch-level [B, L, D] where L=num_patches.
         # We need point-level [B, N, D]. This MLP refines the interpolated features.
         self.point_upscale = nn.Sequential(
@@ -232,12 +237,12 @@ class GraspDecoder3D(nn.Module):
 
     def forward(
         self,
-        pc_embeddings:          torch.Tensor,  # [B, L, D] patch-level embeddings
-        pc_pe:                  torch.Tensor,  # [B, L, D] positional encoding
+        pc_embeddings: torch.Tensor,  # [B, L, D] patch-level embeddings
+        pc_pe: torch.Tensor,  # [B, L, D] positional encoding
         sparse_prompt_embeddings: torch.Tensor, # [B*M, K, D] point prompt embeddings
-        dense_prompt_embeddings:  torch.Tensor, # [B*M, L, D] mask prompt embeddings
-        aux_inputs:             AuxInputs,     # contains coords, features, centers
-        multimask_output:       bool = True,
+        dense_prompt_embeddings: torch.Tensor, # [B*M, L, D] mask prompt embeddings
+        aux_inputs: AuxInputs,     # contains coords, features, centers
+        multimask_output: bool = True,
     ) -> GraspPredictions:
         """
         Forward pass.
@@ -251,7 +256,7 @@ class GraspDecoder3D(nn.Module):
             K  = number of sparse prompt tokens
         """
 
-        # ── Step 1: Build token sequence ───────────────────────────────────
+        #  Step 1: Build token sequence 
         # Concatenate all learnable tokens into one sequence.
         # Order: [iou | mask_0..3 | quality | rot_0..5 | width]
         # Shape: [1, num_tokens, D]
@@ -282,7 +287,7 @@ class GraspDecoder3D(nn.Module):
         # tokens: [B*M, num_tokens + K, D]
         tokens = torch.cat([output_tokens, sparse_prompt_embeddings], dim=1)
 
-        # ── Step 2: Expand pc_embeddings to match B*M ─────────────────────
+        #  Step 2: Expand pc_embeddings to match B*M 
         # pc_embeddings is [B, L, D] but tokens are [B*M, ...]
         # repeat each scene embedding M times
         M = batch_size // pc_embeddings.shape[0]
@@ -291,14 +296,14 @@ class GraspDecoder3D(nn.Module):
 
         pos_src = pc_pe.repeat_interleave(M, dim=0)      # [B*M, L, D]
 
-        # ── Step 3: TwoWayTransformer ──────────────────────────────────────
+        #  Step 3: TwoWayTransformer ─
         # Bidirectional cross-attention between tokens and point cloud.
         # After this:
         #   hs  : updated token embeddings [B*M, num_tokens+K, D]
         #   src : updated point cloud embeddings [B*M, L, D]
         hs, src = self.transformer(src, pos_src, tokens)
 
-        # ── Step 4: Extract token outputs ─────────────────────────────────
+        #  Step 4: Extract token outputs ─
         if self.joint_mask_grasp:
             iou_token_out    = hs[:, 0, :]       # [B*M, D]
             mask_tokens_out  = hs[:, 1:5, :]     # [B*M, 4, D]
@@ -310,7 +315,7 @@ class GraspDecoder3D(nn.Module):
             rotation_toks    = hs[:, 1:7, :]      # [B*M, 6, D]
             width_tok        = hs[:, 7, :]         # [B*M, D]
 
-        # ── Step 5: Interpolate patch features → point features ────────────
+        #  Step 5: Interpolate patch features -> point features 
         # src is patch-level [B*M, L, D]. We need point-level [B*M, N, D].
         # Use the precomputed interpolation weights from the encoder.
         # (same mechanism PointSAM uses in its mask decoder)
@@ -329,19 +334,19 @@ class GraspDecoder3D(nn.Module):
         point_features = interpolate_features(src, interp_index, interp_weight)
         point_features = self.point_upscale(point_features)  # refine
 
-        # ── Step 6: Predict per-point grasp parameters ────────────────────
+        #  Step 6: Predict per-point grasp parameters ─
         # Hypernetwork pattern:
-        #   token_mlp(token) → weight_vec [D]
-        #   weight_vec [D] dot point_features [N, D] → per_point_output [N]
+        #   token_mlp(token) -> weight_vec [D]
+        #   weight_vec [D] dot point_features [N, D] -> per_point_output [N]
 
-        # Quality: [B*M, D] → [B*M, D] → dot [B*M, N, D] → [B*M, N]
+        # Quality: [B*M, D] -> [B*M, D] -> dot [B*M, N, D] -> [B*M, N]
         quality_weights = self.quality_head(quality_tok)          # [B*M, D]
         grasp_quality   = torch.einsum(
             'bd,bnd->bn', quality_weights, point_features
         )  # [B*M, N]
-        grasp_quality   = torch.sigmoid(grasp_quality)            # → [0, 1]
+        grasp_quality   = torch.sigmoid(grasp_quality)            # -> [0, 1]
 
-        # Rotation: 6 tokens → 6 weight vectors → 6 per-point values → [B*M, N, 6]
+        # Rotation: 6 tokens -> 6 weight vectors -> 6 per-point values -> [B*M, N, 6]
         rot_outputs = []
         for i, rot_head in enumerate(self.rotation_heads):
             rot_weight = rot_head(rotation_toks[:, i, :])        # [B*M, D]
@@ -351,14 +356,14 @@ class GraspDecoder3D(nn.Module):
             rot_outputs.append(rot_out)
         grasp_rotation = torch.stack(rot_outputs, dim=-1)         # [B*M, N, 6]
 
-        # Width: [B*M, D] → [B*M, D] → dot [B*M, N, D] → [B*M, N, 1]
+        # Width: [B*M, D] -> [B*M, D] -> dot [B*M, N, D] -> [B*M, N, 1]
         width_weights = self.width_head(width_tok)                # [B*M, D]
         grasp_width   = torch.einsum(
             'bd,bnd->bn', width_weights, point_features
         ).unsqueeze(-1)  # [B*M, N, 1]
         grasp_width   = F.softplus(grasp_width)  # ensure positive width
 
-        # ── Step 7: Mask prediction (joint mode only) ─────────────────────
+        #  Step 7: Mask prediction (joint mode only) 
         masks     = None
         iou_preds = None
 
@@ -370,7 +375,7 @@ class GraspDecoder3D(nn.Module):
                 for i in range(self.NUM_MASK_TOKENS)
             ], dim=1)  # [B*M, 4, D]
 
-            # [B*M, 4, D] dot [B*M, N, D] → [B*M, 4, N]
+            # [B*M, 4, D] dot [B*M, N, D] -> [B*M, 4, N]
             masks = torch.einsum(
                 'bmd,bnd->bmn', mask_weights, point_features
             )  # [B*M, 4, N]

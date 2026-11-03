@@ -124,6 +124,50 @@ class GraspPointSAM(nn.Module):
             param.requires_grad = True
         print("Encoder unfrozen.")
 
+    # Mask prompt encoding
+    def _encode_masks(
+        self,
+        prompt_masks: Optional[torch.Tensor],
+        coords: torch.Tensor,
+        centers: torch.Tensor,
+        knn_idx: torch.Tensor,
+        fps_idx: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Run mask_encoder one mask at a time to bound peak GPU memory.
+        Its [*, L, K, 512] activations are ~0.5 GB per mask with
+        1024 patches x 256 neighbors, so encoding all B*M masks at once
+        does not fit on small GPUs. Each mask is encoded independently,
+        so the result is identical.
+
+        Args:
+            prompt_masks : [B*M, N] or None
+            coords : [B, N, 3]
+            centers : [B, L, 3]
+            knn_idx : [B, L, K]
+            fps_idx : [B, L] or None
+
+        Returns:
+            [B, L, D] if prompt_masks is None, else [B*M, L, D]
+        """
+        if prompt_masks is None:
+            return self.mask_encoder(
+                None, coords, centers, knn_idx, center_idx=fps_idx,
+            )
+
+        M = prompt_masks.shape[0] // coords.shape[0]
+        dense_embeddings = []
+        for r in range(prompt_masks.shape[0]):
+            b = r // M  # scene index of this mask
+            dense_embeddings.append(self.mask_encoder(
+                prompt_masks[r:r + 1],
+                coords[b:b + 1],
+                centers[b:b + 1],
+                knn_idx[b:b + 1],
+                center_idx=None if fps_idx is None else fps_idx[b:b + 1],
+            ))
+        return torch.cat(dense_embeddings, dim=0)
+
     # Core forward — used during inference
     def predict(
         self,
@@ -168,17 +212,21 @@ class GraspPointSAM(nn.Module):
         sparse_embeddings = self.point_encoder(prompt_coords, prompt_labels)
 
         # 4. Encode mask prompt → dense embeddings
-        dense_embeddings = self.mask_encoder(
+        dense_embeddings = self._encode_masks(
             prompt_masks,
             coords,
             centers,
             knn_idx,
-            center_idx=patches.get("fps_idx"),
+            patches.get("fps_idx"),
         )
 
-        # Expand dense embeddings from [B, L, D] to [B*M, L, D]
+        # Expand [B, L, D] -> [B*M, L, D] to match the prompts
+        # (mask_encoder already returns [B*M, L, D] when prompt_masks is given)
         M = sparse_embeddings.shape[0] // pc_embeddings.shape[0]
-        dense_embeddings = repeat_interleave(dense_embeddings, M, dim=0)
+        if dense_embeddings.shape[0] == pc_embeddings.shape[0]:
+            dense_embeddings = repeat_interleave(dense_embeddings, M, dim=0)
+        pc_embeddings = repeat_interleave(pc_embeddings, M, dim=0)
+        pc_pe         = repeat_interleave(pc_pe, M, dim=0)
 
         # 5. GraspDecoder3D
         predictions = self.grasp_decoder(
@@ -214,10 +262,11 @@ class GraspPointSAM(nn.Module):
         """
 
         # Encode point cloud once — reused across all iterations
-        pc_embeddings, patches = self.pc_encoder(coords, features)
-        centers = patches["centers"]
-        knn_idx = patches["knn_idx"]
-        pc_pe = self.point_encoder.pe_layer(centers)
+        with torch.no_grad():
+            pc_embeddings, patches = self.pc_encoder(coords, features)
+            centers = patches["centers"]
+            knn_idx = patches["knn_idx"]
+            pc_pe = self.point_encoder.pe_layer(centers)
 
         aux_inputs = AuxInputs(
             coords = coords,
@@ -228,35 +277,52 @@ class GraspPointSAM(nn.Module):
         outputs = []
         prompt_masks = None
 
+        # Masks padded in by collate_fn (batch_size > 1) are all zero and
+        # sample_prompts cannot pick a point from them. Give each one a
+        # single placeholder point; these rows are excluded from the loss
+        # and every B*M row is decoded independently, so real rows are
+        # unaffected.
+        prompt_gt_masks = gt_masks.clone()
+        empty = prompt_gt_masks.sum(-1) == 0  # [B, M]
+        prompt_gt_masks[..., 0][empty] = 1
+
         for i in range(self.prompt_iters):
 
             # Sample prompt points from ground truth masks
             prompt_coords, prompt_labels = sample_prompts(
                 coords,
-                gt_masks,
-                is_eval=is_eval,
+                prompt_gt_masks,
+                pred_logits=prompt_masks,
             )
 
             # Encode prompts
             sparse_embeddings = self.point_encoder(prompt_coords, prompt_labels)
-            dense_embeddings = self.mask_encoder(
+            dense_embeddings = self._encode_masks(
                 prompt_masks,
                 coords,
                 centers,
                 knn_idx,
-                center_idx=patches.get("fps_idx"),
+                patches.get("fps_idx"),
             )
 
             M = sparse_embeddings.shape[0] // pc_embeddings.shape[0]
-            dense_embeddings = repeat_interleave(dense_embeddings, M, dim=0)
 
+            # mask_encoder returns [B, L, D] when prompt_masks=None
+            # but [B*M, L, D] when prompt_masks is not None
+            # only expand if still at batch size B
+            if dense_embeddings.shape[0] == pc_embeddings.shape[0]:
+                dense_embeddings = repeat_interleave(dense_embeddings, M, dim=0)
+
+            pc_embeddings_exp = repeat_interleave(pc_embeddings, M, dim=0)
+            pc_pe_exp         = repeat_interleave(pc_pe, M, dim=0)
+            
             predictions = self.grasp_decoder(
-                pc_embeddings = pc_embeddings,
-                pc_pe = pc_pe,
+                pc_embeddings            = pc_embeddings_exp,
+                pc_pe                    = pc_pe_exp,
                 sparse_prompt_embeddings = sparse_embeddings,
-                dense_prompt_embeddings = dense_embeddings,
-                aux_inputs = aux_inputs,
-                multimask_output = (i == 0),
+                dense_prompt_embeddings  = dense_embeddings,
+                aux_inputs               = aux_inputs,
+                multimask_output         = (i == 0),
             )
 
             outputs.append(predictions)

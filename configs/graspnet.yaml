@@ -39,11 +39,11 @@ model:
   prompt_iters: 5
 
 training:
-  batch_size: 2
+  batch_size: 1
   num_points: 10000
   learning_rate: 3.0e-4        # confirmed from official large.yaml
   weight_decay: 0.1            # confirmed from official large.yaml
-  max_epochs: 50               # reduced from official 10000 (cloud training)
+  max_epochs: 10               # reduced from official 10000 (cloud training)
   max_grad_value: 1.0          # confirmed from official large.yaml
   gradient_accumulation_steps: 1
   mixed_precision: "fp16"      # essential for memory efficiency

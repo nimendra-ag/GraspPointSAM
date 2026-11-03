@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 from dataclasses import dataclass
 
-from .common import interpolate_features, compute_interp_weights
+from .common import interpolate_features, compute_interp_weights, repeat_interleave
 from .mask_decoder import AuxInputs, MLP
 
 # Data container for decoder outputs
@@ -49,7 +49,7 @@ class GraspPredictions:
         Per-point segmentation mask logits (before sigmoid).
         Only populated when joint_mask_grasp=True.
     
-    iou_preds : [B*M, num_mask_tokens] or None
+    iou_preds : [B*M, num_masks] or None
         IoU predictions for mask quality estimation.
         Only populated when joint_mask_grasp=True.
     """
@@ -57,7 +57,7 @@ class GraspPredictions:
     grasp_rotation: torch.Tensor    # [B*M, N, 6]
     grasp_width: torch.Tensor       # [B*M, N, 1]
     masks: Optional[torch.Tensor]   # [B*M, N] or None
-    iou_preds: Optional[torch.Tensor] # [B*M, num_mask_tokens] or None
+    iou_preds: Optional[torch.Tensor] # [B*M, num_masks] or None
 
 
 # Small MLP used for per-point prediction heads
@@ -329,6 +329,12 @@ class GraspDecoder3D(nn.Module):
             interp_index  = aux_inputs.interp_index
             interp_weight = aux_inputs.interp_weight
 
+        # interp weights are per scene [B, N, K] but src is [B*M, L, D]
+        # repeat each scene's weights M times to match
+        M = src.shape[0] // interp_index.shape[0]
+        interp_index  = repeat_interleave(interp_index, M, dim=0)   # [B*M, N, K]
+        interp_weight = repeat_interleave(interp_weight, M, dim=0)  # [B*M, N, K]
+
         # point_features: [B*M, N, D]
         point_features = interpolate_features(src, interp_index, interp_weight)
         point_features = self.point_upscale(point_features)  # refine
@@ -379,19 +385,22 @@ class GraspDecoder3D(nn.Module):
                 'bmd,bnd->bmn', mask_weights, point_features
             )  # [B*M, 4, N]
 
-            # Select single or multi mask output
-            if multimask_output:
-                masks = masks[:, 1:, :]   # [B*M, 3, N] — 3 multi-mask outputs
-            else:
-                masks = masks[:, 0:1, :]  # [B*M, 1, N] — single best mask
-
             # IoU prediction: how good is the predicted mask?
             iou_preds = self.iou_prediction_head(iou_token_out)  # [B*M, 4]
+
+            # Select single or multi mask output — iou_preds sliced the same
+            # way so iou_preds[:, k] always scores masks[:, k]
+            if multimask_output:
+                masks     = masks[:, 1:, :]   # [B*M, 3, N] — 3 multi-mask outputs
+                iou_preds = iou_preds[:, 1:]  # [B*M, 3]
+            else:
+                masks     = masks[:, 0:1, :]  # [B*M, 1, N] — single best mask
+                iou_preds = iou_preds[:, 0:1] # [B*M, 1]
 
         return GraspPredictions(
             grasp_quality  = grasp_quality,   # [B*M, N]
             grasp_rotation = grasp_rotation,  # [B*M, N, 6]
             grasp_width    = grasp_width,     # [B*M, N, 1]
             masks          = masks,           # [B*M, num_masks, N] or None
-            iou_preds      = iou_preds,       # [B*M, 4] or None
+            iou_preds      = iou_preds,       # [B*M, num_masks] or None
         )

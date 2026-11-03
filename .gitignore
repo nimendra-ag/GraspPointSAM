@@ -3,3 +3,5 @@ pretrained/
 **/__pycache__/
 
 temp.py
+**.npz
+**.pth

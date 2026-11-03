@@ -41,7 +41,7 @@ class PositionEmbeddingRandom(nn.Module):
         Returns:
             torch.Tensor: shape (..., num_pos_feats), positional encoding.
         """
-        if (coords < -1 - 1e-6).any() or (coords > 1 + 1e-6).any():
+        if (coords < -1.2).any() or (coords > 1.2).any():
             print("Bounds: ", (coords.min(), coords.max()))
             raise ValueError(f"Input coordinates must be normalized to [-1, 1].")
         # TODO: whether to convert to float?

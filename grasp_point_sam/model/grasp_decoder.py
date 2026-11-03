@@ -54,7 +54,7 @@ class GraspPredictions:
         Only populated when joint_mask_grasp=True.
     """
     grasp_quality: torch.Tensor     # [B*M, N]
-    grasp_rotation: torch.Tens      # [B*M, N, 6]
+    grasp_rotation: torch.Tensor    # [B*M, N, 6]
     grasp_width: torch.Tensor       # [B*M, N, 1]
     masks: Optional[torch.Tensor]   # [B*M, N] or None
     iou_preds: Optional[torch.Tensor] # [B*M, num_mask_tokens] or None
@@ -290,11 +290,10 @@ class GraspDecoder3D(nn.Module):
         #  Step 2: Expand pc_embeddings to match B*M 
         # pc_embeddings is [B, L, D] but tokens are [B*M, ...]
         # repeat each scene embedding M times
-        M = batch_size // pc_embeddings.shape[0]
-        src = pc_embeddings.repeat_interleave(M, dim=0)  # [B*M, L, D]
-        src = src + dense_prompt_embeddings               # add mask prompt
-
-        pos_src = pc_pe.repeat_interleave(M, dim=0)      # [B*M, L, D]
+        # pc_embeddings and pc_pe are already [B*M, L, D]
+        # expanded in grasp_point_sam.py before being passed here
+        src     = pc_embeddings + dense_prompt_embeddings  # [B*M, L, D]
+        pos_src = pc_pe                                    # [B*M, L, D]
 
         #  Step 3: TwoWayTransformer ─
         # Bidirectional cross-attention between tokens and point cloud.

@@ -5,3 +5,5 @@ pretrained/
 temp.py
 **.npz
 **.pth
+data-rgbdmatter/
+**.npy

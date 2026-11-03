@@ -22,6 +22,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_scatter import scatter_min
 from typing import Dict, List, Optional, Tuple
 
 
@@ -166,6 +167,56 @@ def weighted_mse(
     return fore_loss + bg_weight * back_loss
 
 
+def nearest_grasp_loss(
+    pred_rotation: torch.Tensor,
+    pred_width:    torch.Tensor,
+    point_idx:     torch.Tensor,
+    gt_rotation:   torch.Tensor,
+    gt_width:      torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Rotation and width loss when a point has several valid grasps.
+
+    Each labelled point is compared with ALL of its ground-truth grasps
+    and only the closest one (smallest rotation error) is penalised, so
+    predicting any valid grasp is correct. Regressing to one arbitrary
+    grasp would instead pull the prediction towards the average of
+    several valid rotations, which is often not a valid grasp.
+    Same idea as Contact-GraspNet's min-over-ground-truth loss.
+
+    Args:
+        pred_rotation: [B*M, N, 6] predicted 6D rotation
+        pred_width:    [B*M, N, 1] predicted width
+        point_idx:     [T] flat index (into B*M*N) of each ground-truth grasp
+        gt_rotation:   [T, 6] 6D rotation of each ground-truth grasp
+        gt_width:      [T]    width of each ground-truth grasp
+
+    Returns:
+        rotation_loss, width_loss (scalars)
+    """
+    if point_idx.numel() == 0:
+        warnings.warn(
+            "nearest_grasp_loss: no point in the batch has a ground-truth "
+            "grasp, rotation and width loss are 0 for this batch"
+        )
+        zero = pred_rotation.sum() * 0.0
+        return zero, zero
+
+    pred_rot = pred_rotation.reshape(-1, 6)[point_idx].float()      # [T, 6]
+    rot_err  = (pred_rot - gt_rotation.float()).square().mean(-1)   # [T]
+
+    # group the grasps by point and keep the closest one per point
+    _, group      = torch.unique(point_idx, return_inverse=True)
+    min_err, best = scatter_min(rot_err, group, dim=0)              # [U]
+
+    rotation_loss = min_err.mean()
+
+    pred_w     = pred_width.reshape(-1)[point_idx[best]].float()    # [U]
+    width_loss = F.mse_loss(pred_w, gt_width[best].float())
+
+    return rotation_loss, width_loss
+
+
 def compute_iou(
     logits:  torch.Tensor,
     targets: torch.Tensor,
@@ -264,8 +315,8 @@ class GraspPointSAMLoss(nn.Module):
         mask_loss  = dice + bce
 
     Ours (3D):
-        grasp_loss = weighted_mse(quality) + weighted_mse(rotation) +
-                     weighted_mse(width)
+        grasp_loss = weighted_mse(quality) +
+                     nearest_grasp_loss(rotation, width)  ← all gt grasps per point
         mask_loss  = focal + dice + mse(iou_pred)  ← from PointSAM
 
     Total = grasp_scale * grasp_loss + mask_scale * mask_loss
@@ -304,8 +355,9 @@ class GraspPointSAMLoss(nn.Module):
         outputs:   List,           # List of GraspPredictions from forward()
         gt_masks:  torch.Tensor,   # [B*M, N] ground truth masks
         gt_quality:  torch.Tensor, # [B*M, N] ground truth grasp quality
-        gt_rotation: torch.Tensor, # [B*M, N, 6] ground truth 6D rotation
-        gt_width:    torch.Tensor, # [B*M, N, 1] ground truth width
+        grasp_point_idx: torch.Tensor,  # [T] flat index into B*M*N
+        gt_rotation: torch.Tensor, # [T, 6] 6D rotation of each gt grasp
+        gt_width:    torch.Tensor, # [T] width of each gt grasp
         valid:       Optional[torch.Tensor] = None,  # [B*M] bool, False = padding
     ) -> Dict[str, torch.Tensor]:
         """
@@ -320,8 +372,11 @@ class GraspPointSAMLoss(nn.Module):
             outputs:     List[GraspPredictions] one per prompt iteration
             gt_masks:    [B*M, N] bool ground truth segmentation masks
             gt_quality:  [B*M, N] float grasp quality (0=no grasp, >0=quality)
-            gt_rotation: [B*M, N, 6] 6D rotation ground truth
-            gt_width:    [B*M, N, 1] gripper width ground truth
+            grasp_point_idx: [T] flat index (into B*M*N) of the point each
+                         ground-truth grasp belongs to; a point can have
+                         many grasps
+            gt_rotation: [T, 6] 6D rotation of each ground-truth grasp
+            gt_width:    [T] gripper width of each ground-truth grasp
             valid:       [B*M] bool, False for objects padded in by
                          collate_fn when batch_size > 1. These rows are
                          dropped so padding never affects the loss.
@@ -335,10 +390,20 @@ class GraspPointSAMLoss(nn.Module):
         if valid is not None:
             gt_masks    = gt_masks[valid]
             gt_quality  = gt_quality[valid]
-            gt_rotation = gt_rotation[valid]
-            gt_width    = gt_width[valid]
+            # gt grasps only exist on real objects, never on padded rows,
+            # so grasp_point_idx / gt_rotation / gt_width need no filtering
 
         for i, predictions in enumerate(outputs):
+
+            # before padding rows are dropped: grasp_point_idx indexes the
+            # full B*M*N layout
+            rotation_loss, width_loss = nearest_grasp_loss(
+                pred_rotation = predictions.grasp_rotation,  # [B*M, N, 6]
+                pred_width    = predictions.grasp_width,     # [B*M, N, 1]
+                point_idx     = grasp_point_idx,             # [T]
+                gt_rotation   = gt_rotation,                 # [T, 6]
+                gt_width      = gt_width,                    # [T]
+            )
 
             if valid is not None:
                 predictions = dataclasses.replace(predictions, **{
@@ -348,26 +413,14 @@ class GraspPointSAMLoss(nn.Module):
                 })
 
             # ── Grasp losses ─────────────────────────────────────────────
-            # Adapted from GraspSAM's weighted_mse approach:
-            # use gt_quality as the weight — only supervise where
-            # there are valid grasps (quality > 0)
+            # Quality: GraspSAM's weighted_mse, gt_quality as the weight.
+            # Rotation / width: nearest_grasp_loss above, only on points
+            # that have grasps.
 
             quality_loss = weighted_mse(
                 pred   = predictions.grasp_quality,   # [B*M, N]
                 target = gt_quality,                   # [B*M, N]
                 weight = gt_quality,                   # supervise all points
-            )
-
-            rotation_loss = weighted_mse(
-                pred   = predictions.grasp_rotation,  # [B*M, N, 6]
-                target = gt_rotation,                  # [B*M, N, 6]
-                weight = gt_quality,                   # only where grasp exists
-            )
-
-            width_loss = weighted_mse(
-                pred   = predictions.grasp_width.squeeze(-1),  # [B*M, N]
-                target = gt_width.squeeze(-1),                  # [B*M, N]
-                weight = gt_quality,
             )
 
             grasp_loss = (

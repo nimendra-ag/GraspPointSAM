@@ -4,8 +4,8 @@ Training script for GraspPointSAM.
 Follows GraspSAM's simple training style.
 
 Usage:
-    python train.py --scene_zip /path/to/train_1.zip \
-                    --grasp_zip /path/to/grasp_label.zip
+    python prepare_grasp_labels.py --config configs/graspnet.yaml   # once
+    python train.py --config configs/graspnet.yaml
 """
 
 import argparse
@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 
 from grasp_point_sam.model.build_model import build_model
-from grasp_point_sam.data.graspnet_dataset import GraspNetDataset
+from grasp_point_sam.data.graspnet_dataset import GraspNetDataset, scene_range
 from grasp_point_sam.losses.grasp_loss import GraspPointSAMLoss
 
 
@@ -28,8 +28,6 @@ from grasp_point_sam.losses.grasp_loss import GraspPointSAMLoss
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config',     type=str, default='configs/graspnet.yaml')
-    parser.add_argument('--scene_zip',  type=str, required=True)
-    parser.add_argument('--grasp_zip',  type=str, required=True)
     parser.add_argument('--resume',     type=str, default=None)
     parser.add_argument('--save',       type=bool, default=True)
     return parser.parse_args()
@@ -42,15 +40,16 @@ def parse_args():
 def collate_fn(batch):
     max_M = max(s['masks'].shape[0] for s in batch)
 
-    coords_list   = []
-    features_list = []
-    masks_list    = []
-    quality_list  = []
-    rotation_list = []
-    width_list    = []
-    valid_list    = []
+    coords_list    = []
+    features_list  = []
+    masks_list     = []
+    quality_list   = []
+    point_idx_list = []
+    rotation_list  = []
+    width_list     = []
+    valid_list     = []
 
-    for s in batch:
+    for b, s in enumerate(batch):
         M, N = s['masks'].shape
         pad  = max_M - M
 
@@ -65,25 +64,25 @@ def collate_fn(batch):
             s['grasp_quality'], torch.zeros(pad, N)
         ], dim=0))
 
-        rotation_list.append(torch.cat([
-            s['grasp_rotation'], torch.zeros(pad, N, 6)
-        ], dim=0))
-
-        width_list.append(torch.cat([
-            s['grasp_width'], torch.zeros(pad, N, 1)
-        ], dim=0))
+        # ground-truth grasps are a flat list per sample (a point can have
+        # many); shift their index from this sample's M*N layout into the
+        # padded batch's B*max_M*N layout
+        point_idx_list.append(s['grasp_point_idx'] + b * max_M * N)
+        rotation_list.append(s['grasp_rotation'])
+        width_list.append(s['grasp_width'])
 
         # False for padded (fake) objects so the loss can ignore them
         valid_list.append(torch.arange(max_M) < M)
 
     return {
-        'coords':         torch.stack(coords_list),
-        'features':       torch.stack(features_list),
-        'masks':          torch.stack(masks_list),
-        'grasp_quality':  torch.stack(quality_list),
-        'grasp_rotation': torch.stack(rotation_list),
-        'grasp_width':    torch.stack(width_list),
-        'mask_valid':     torch.stack(valid_list),
+        'coords':          torch.stack(coords_list),
+        'features':        torch.stack(features_list),
+        'masks':           torch.stack(masks_list),
+        'grasp_quality':   torch.stack(quality_list),
+        'grasp_point_idx': torch.cat(point_idx_list),
+        'grasp_rotation':  torch.cat(rotation_list),
+        'grasp_width':     torch.cat(width_list),
+        'mask_valid':      torch.stack(valid_list),
     }
 
 
@@ -100,6 +99,7 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, epoch, 
         features    = batch['features'].to(device)
         masks       = batch['masks'].to(device)
         gt_quality  = batch['grasp_quality'].to(device)
+        gt_point    = batch['grasp_point_idx'].to(device)
         gt_rotation = batch['grasp_rotation'].to(device)
         gt_width    = batch['grasp_width'].to(device)
         mask_valid  = batch['mask_valid'].to(device)
@@ -107,8 +107,6 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, epoch, 
         # Flatten B*M
         gt_masks_flat    = masks.flatten(0, 1).bool()
         gt_quality_flat  = gt_quality.flatten(0, 1)
-        gt_rotation_flat = gt_rotation.flatten(0, 1)
-        gt_width_flat    = gt_width.flatten(0, 1)
         mask_valid_flat  = mask_valid.flatten(0, 1)
 
         optimizer.zero_grad()
@@ -119,8 +117,9 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, epoch, 
                 outputs      = outputs,
                 gt_masks     = gt_masks_flat,
                 gt_quality   = gt_quality_flat,
-                gt_rotation  = gt_rotation_flat,
-                gt_width     = gt_width_flat,
+                grasp_point_idx = gt_point,
+                gt_rotation  = gt_rotation,
+                gt_width     = gt_width,
                 valid        = mask_valid_flat,
             )
 
@@ -161,14 +160,13 @@ def validate(model, criterion, loader, device, cfg):
         features    = batch['features'].to(device)
         masks       = batch['masks'].to(device)
         gt_quality  = batch['grasp_quality'].to(device)
+        gt_point    = batch['grasp_point_idx'].to(device)
         gt_rotation = batch['grasp_rotation'].to(device)
         gt_width    = batch['grasp_width'].to(device)
         mask_valid  = batch['mask_valid'].to(device)
 
         gt_masks_flat    = masks.flatten(0, 1).bool()
         gt_quality_flat  = gt_quality.flatten(0, 1)
-        gt_rotation_flat = gt_rotation.flatten(0, 1)
-        gt_width_flat    = gt_width.flatten(0, 1)
         mask_valid_flat  = mask_valid.flatten(0, 1)
 
         with torch.cuda.amp.autocast(enabled=(cfg.training.mixed_precision == 'fp16')):
@@ -177,8 +175,9 @@ def validate(model, criterion, loader, device, cfg):
                 outputs      = outputs,
                 gt_masks     = gt_masks_flat,
                 gt_quality   = gt_quality_flat,
-                gt_rotation  = gt_rotation_flat,
-                gt_width     = gt_width_flat,
+                grasp_point_idx = gt_point,
+                gt_rotation  = gt_rotation,
+                gt_width     = gt_width,
                 valid        = mask_valid_flat,
             )
 
@@ -248,21 +247,26 @@ def main():
 
     # Datasets
     print("Loading datasets...")
+    dataset_args = dict(
+        graspnet_root    = cfg.data.graspnet_root,
+        label_dir        = cfg.data.label_dir,
+        cameras          = cfg.data.cameras,
+        num_points       = cfg.training.num_points,
+        frames_per_scene = cfg.data.frames_per_scene,
+        fric_coef_thresh = cfg.data.fric_coef_thresh,
+        grasp_radius     = cfg.data.grasp_radius,
+    )
     train_dataset = GraspNetDataset(
-        scene_zip_path = args.scene_zip,
-        grasp_zip_path = args.grasp_zip,
-        num_points     = cfg.training.num_points,
-        num_frames     = 1,
-        split          = 'train',
-        augment        = True,
+        scene_ids = scene_range(cfg.data.train_scenes),
+        split     = 'train',
+        augment   = True,
+        **dataset_args,
     )
     val_dataset = GraspNetDataset(
-        scene_zip_path = args.scene_zip,
-        grasp_zip_path = args.grasp_zip,
-        num_points     = cfg.training.num_points,
-        num_frames     = 1,
-        split          = 'val',
-        augment        = False,
+        scene_ids = scene_range(cfg.data.val_scenes),
+        split     = 'val',
+        augment   = False,
+        **dataset_args,
     )
 
     train_loader = DataLoader(

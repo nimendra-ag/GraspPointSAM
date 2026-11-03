@@ -60,8 +60,14 @@ training:
     gamma: 0.1
 
 data:
-  root: "data/graspnet"
-  split_file: "data/graspnet/splits.json"
+  graspnet_root: "/mnt/f/graspnet"       # graspnetAPI layout: scenes/, grasp_label/, collision_label/
+  label_dir: "data/graspnet_scene_labels"  # per-scene labels from prepare_grasp_labels.py
+  cameras: ["realsense", "kinect"]
+  train_scenes: [0, 90]                  # scene ids [start, end); GraspNet train split is 0-99
+  val_scenes: [90, 100]                  # held out from the train split
+  frames_per_scene: 256                  # per camera, evenly spaced over the 256 frames
+  fric_coef_thresh: 0.1                  # as RGBD-Matter; lower = stricter (graspnetAPI default 0.4)
+  grasp_radius: 0.02                     # m, point -> nearest labelled grasp point
   num_workers: 4
 
 eval:

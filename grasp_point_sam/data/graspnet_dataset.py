@@ -1,51 +1,108 @@
 # grasp_point_sam/data/graspnet_dataset.py
 """
-GraspNet-1B Dataset Loader — reads directly from ZIP files without extraction.
+GraspNet-1Billion dataset loader built on graspnetAPI.
 
-Mirrors graspnetAPI's loading logic exactly, but reads from ZIP files
-instead of extracted folders. Random subsampling to num_points is applied
-after loading — standard practice for all 3D point cloud GraspNet methods.
+Scene data (RGB, depth, segmentation, camera intrinsics) is read through
+graspnetAPI.GraspNet for every frame of every camera. Grasp labels come
+from prepare_grasp_labels.py, which runs steps 1-2 of the official
+GraspNet.loadGrasp once per scene (object frame). Here steps 3-4 are
+done per frame with the same graspnetAPI functions: decode rotations
+and move grasps into the frame's camera view. The result equals
+loadGrasp(format='6d') for that frame.
 
-ZIP files required:
-    - train_1.zip (or train_2/3/4, test_seen, test_similar, test_novel)
-    - grasp_label.zip
+Per sample:
+    - point cloud back-projected from depth, random subsample to num_points
+    - per-point RGB colors
+    - per-object masks from the segmentation image
+    - per-object, per-point grasp quality (1.1 - lowest friction of the
+      point's grasps; 0 = no grasp)
+    - every grasp of every labelled point as a flat list
+      (grasp_point_idx, grasp_rotation, grasp_width), see _assign_grasps
 
-Note: ZIP files are opened lazily per DataLoader worker to avoid
-BadZipFile errors from concurrent access across workers.
+graspnet_root must follow graspnetAPI's layout:
+    <graspnet_root>/scenes/scene_XXXX/<camera>/{rgb,depth,label,meta,annotations}/
+    <graspnet_root>/grasp_label/
+    <graspnet_root>/collision_label/
 """
 
-import io
 import warnings
-import zipfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
+import scipy.io as scio
 import torch
 from PIL import Image
 from scipy.spatial import cKDTree
-from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset
+from graspnetAPI import GraspNet
+from graspnetAPI.utils.rotation import batch_viewpoint_params_to_matrix
+from graspnetAPI.utils.utils import generate_views, get_obj_pose_list, transform_points
+from graspnetAPI.utils.xmlhandler import xmlReader
+
+NUM_VIEWS = 300  # as in GraspNet.loadGrasp
+
+LABEL_FILES = [
+    'points', 'point_obj_ids', 'point_offsets',
+    'grasp_views', 'grasp_angles', 'grasp_depths', 'grasp_widths', 'grasp_fric',
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility functions
 # ─────────────────────────────────────────────────────────────────────────────
 
+def scene_range(bounds: Sequence[int]) -> List[int]:
+    """[start, end) from the config -> list of scene ids."""
+    start, end = bounds
+    return list(range(start, end))
+
+
+def select_frames(frames_per_scene: int) -> List[int]:
+    """Frame (annotation) ids used per scene, evenly spaced over the 256 frames."""
+    return np.linspace(0, 255, frames_per_scene, dtype=int).tolist()
+
+
+def missing_scene_files(graspnet_root: str, scene_id: int) -> List[str]:
+    """
+    Scene-level files that label generation and loading need but that do
+    not exist, e.g. while the dataset is still being extracted.
+    Empty list = complete.
+    """
+    root  = Path(graspnet_root)
+    scene = root / 'scenes' / f'scene_{scene_id:04d}'
+    paths = [
+        scene / 'object_id_list.txt',
+        root / 'collision_label' / f'scene_{scene_id:04d}' / 'collision_labels.npz',
+    ]
+    for camera in ('realsense', 'kinect'):
+        paths += [
+            scene / camera / 'camera_poses.npy',
+            scene / camera / 'annotations' / '0000.xml',
+        ]
+    if (scene / 'object_id_list.txt').exists():
+        obj_ids = (scene / 'object_id_list.txt').read_text().split()
+        paths  += [
+            root / 'grasp_label' / f'{int(i):03d}_labels.npz' for i in obj_ids
+        ]
+    return [str(p) for p in paths if not p.exists()]
+
+
 def depth_to_pointcloud(
-    depth: np.ndarray,
-    rgb:   np.ndarray,
-    camK:  np.ndarray,
+    depth:        np.ndarray,
+    rgb:          np.ndarray,
+    camK:         np.ndarray,
+    factor_depth: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Back-project depth image to 3D point cloud using camera intrinsics.
-    Same as graspnetAPI's loadScenePointCloud logic.
+    Same as graspnetAPI's create_point_cloud_from_depth_image.
 
     Args:
-        depth: [H, W] uint16, depth in millimeters
-        rgb:   [H, W, 3] uint8
-        camK:  [3, 3] camera intrinsic matrix
+        depth:        [H, W] uint16 depth image
+        rgb:          [H, W, 3] uint8
+        camK:         [3, 3] camera intrinsic matrix
+        factor_depth: depth units per meter (from meta .mat)
 
     Returns:
         coords: [H*W, 3] float32, XYZ in meters (camera frame)
@@ -59,7 +116,7 @@ def depth_to_pointcloud(
     v  = np.arange(H, dtype=np.float32)
     uu, vv = np.meshgrid(u, v)
 
-    z  = depth.astype(np.float32) / 1000.0
+    z  = depth.astype(np.float32) / factor_depth
     x  = (uu - cx) * z / fx
     y  = (vv - cy) * z / fy
 
@@ -67,39 +124,6 @@ def depth_to_pointcloud(
     colors = rgb.reshape(-1, 3).astype(np.float32) / 255.0
 
     return coords, colors
-
-
-def parse_annotation_xml(xml_bytes: bytes) -> Dict[int, Dict]:
-    """
-    Parse annotation XML to get object poses in world frame.
-
-    Returns:
-        dict mapping obj_id → {pos: [3], quat: [4]}
-        quat is [w, x, y, z] format
-    """
-    root    = ET.fromstring(xml_bytes.decode())
-    objects = {}
-
-    for obj in root.findall('obj'):
-        obj_id = int(obj.find('obj_id').text)
-        pos    = np.array(
-            obj.find('pos_in_world').text.split(),
-            dtype=np.float32
-        )
-        quat   = np.array(
-            obj.find('ori_in_world').text.split(),
-            dtype=np.float32
-        )
-        objects[obj_id] = {'pos': pos, 'quat': quat}
-
-    return objects
-
-
-def quaternion_to_matrix(quat: np.ndarray) -> np.ndarray:
-    """Convert quaternion [w, x, y, z] to 3x3 rotation matrix."""
-    w, x, y, z = quat
-    R = Rotation.from_quat([x, y, z, w]).as_matrix()
-    return R.astype(np.float32)
 
 
 def rotation_matrix_to_6d(R: np.ndarray) -> np.ndarray:
@@ -118,162 +142,23 @@ def rotation_matrix_to_6d(R: np.ndarray) -> np.ndarray:
     return np.concatenate([R[..., :, 0], R[..., :, 1]], axis=-1)
 
 
-def transform_points_to_camera(
-    points:      np.ndarray,
-    camera_pose: np.ndarray,
-) -> np.ndarray:
-    """
-    Transform points from world frame to camera frame.
-
-    Args:
-        points:      [P, 3] in world frame
-        camera_pose: [4, 4] camera-to-world transform
-
-    Returns:
-        [P, 3] in camera frame
-    """
-    R = camera_pose[:3, :3]
-    t = camera_pose[:3, 3]
-    return ((points - t) @ R).astype(np.float32)
-
-
-def _iter_npy_rows(f, chunk_rows: int):
-    """
-    Stream a .npy file object in chunks along axis 0.
-    Avoids materializing the full array (grasp labels reach ~2.3 GB).
-
-    Yields:
-        (start_row, chunk) with chunk shape [<=chunk_rows, ...]
-    """
-    version = np.lib.format.read_magic(f)
-    if version == (1, 0):
-        shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
-    else:
-        shape, fortran, dtype = np.lib.format.read_array_header_2_0(f)
-    assert not fortran, "Fortran-ordered .npy not supported"
-
-    row_shape = shape[1:]
-    row_bytes = int(np.prod(row_shape, dtype=np.int64)) * dtype.itemsize
-
-    for start in range(0, shape[0], chunk_rows):
-        n   = min(chunk_rows, shape[0] - start)
-        buf = f.read(n * row_bytes)
-        yield start, np.frombuffer(buf, dtype=dtype).reshape((n,) + row_shape)
-
-
-def get_best_grasp_per_point(
-    npz_file,
-    chunk_rows: int = 256,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    For each surface point, find the best valid grasp.
-    Valid = score > 0 and collision=False.
-
-    Reads the label npz member-by-member in row chunks so peak memory
-    stays at a few hundred MB instead of several GB.
-
-    Args:
-        npz_file: file object of an object's *_labels.npz, containing
-            points:    [P, 3]
-            offsets:   [P, 300, 12, 4, 3]
-            scores:    [P, 300, 12, 4]
-            collision: [P, 300, 12, 4]
-
-    Returns:
-        valid_points:  [V, 3]
-        valid_scores:  [V]
-        valid_offsets: [V, 3]
-    """
-    with zipfile.ZipFile(npz_file) as npz:
-        with npz.open('points.npy') as f:
-            points = np.lib.format.read_array(f)
-        P = points.shape[0]
-
-        with npz.open('collision.npy') as f:
-            collision = np.lib.format.read_array(f).reshape(P, -1)
-
-        best_idx    = np.zeros(P, dtype=np.int64)
-        best_scores = np.zeros(P, dtype=np.float32)
-        has_valid   = np.zeros(P, dtype=bool)
-
-        with npz.open('scores.npy') as f:
-            for start, chunk in _iter_npy_rows(f, chunk_rows):
-                chunk = chunk.reshape(len(chunk), -1)
-                end   = start + len(chunk)
-                valid = (chunk > 0) & (~collision[start:end])
-                masked = np.where(valid, chunk, -np.inf)
-
-                idx = np.argmax(masked, axis=1)
-                best_idx[start:end]    = idx
-                best_scores[start:end] = chunk[np.arange(len(chunk)), idx]
-                has_valid[start:end]   = valid.any(axis=1)
-        del collision
-
-        has_valid &= best_scores > 0
-
-        best_offsets = np.zeros((P, 3), dtype=np.float32)
-        with npz.open('offsets.npy') as f:
-            for start, chunk in _iter_npy_rows(f, chunk_rows):
-                chunk = chunk.reshape(len(chunk), -1, 3)
-                end   = start + len(chunk)
-                best_offsets[start:end] = chunk[
-                    np.arange(len(chunk)), best_idx[start:end]
-                ]
-
-    return (
-        points[has_valid].astype(np.float32),
-        best_scores[has_valid],
-        best_offsets[has_valid],
-    )
-
-
 def nearest_neighbor(
-    coords_norm:    np.ndarray,
-    valid_pts_norm: np.ndarray,
+    query: np.ndarray,
+    key:   np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    KD-tree nearest neighbor (no [N, V, 3] intermediate).
+    KD-tree nearest neighbor.
 
     Args:
-        coords_norm:    [N, 3] scene points normalized
-        valid_pts_norm: [V, 3] grasp surface points normalized
+        query: [N, 3]
+        key:   [V, 3]
 
     Returns:
-        nn_idx:   [N] index into valid_pts_norm
-        nn_dists: [N] squared distance to nearest grasp point
+        nn_idx:   [N] index into key
+        nn_dists: [N] squared distance to nearest key point
     """
-    dists, nn_idx = cKDTree(valid_pts_norm).query(coords_norm, k=1)
+    dists, nn_idx = cKDTree(key).query(query, k=1)
     return nn_idx.astype(np.int64), (dists ** 2).astype(np.float32)
-
-
-def approach_to_rotation(approach: np.ndarray) -> np.ndarray:
-    """
-    Build rotation matrices from approach vectors.
-    Approach vector = z-axis of gripper frame.
-
-    Args:
-        approach: [K, 3] unit vectors
-
-    Returns:
-        R: [K, 3, 3]
-    """
-    K   = approach.shape[0]
-    R   = np.zeros((K, 3, 3), dtype=np.float32)
-    z   = approach
-
-    ref           = np.tile([0, 1, 0], (K, 1)).astype(np.float32)
-    parallel      = np.abs(np.sum(z * ref, axis=-1)) > 0.9
-    ref[parallel] = [1, 0, 0]
-
-    x  = np.cross(ref, z)
-    x /= np.maximum(np.linalg.norm(x, axis=-1, keepdims=True), 1e-6)
-    y  = np.cross(z, x)
-
-    R[:, :, 0] = x
-    R[:, :, 1] = y
-    R[:, :, 2] = z
-
-    return R
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,141 +167,122 @@ def approach_to_rotation(approach: np.ndarray) -> np.ndarray:
 
 class GraspNetDataset(Dataset):
     """
-    GraspNet-1B dataset loader from ZIP files.
+    GraspNet-1Billion dataset loader on top of graspnetAPI.
 
-    Mirrors graspnetAPI loading exactly:
-    - Full point cloud from depth back-projection
-    - Random subsample to num_points (standard for 3D point cloud methods)
-    - Per-point RGB colors
-    - Per-point object masks
-    - Per-point 6-DOF grasp labels
-
-    ZIP files are opened lazily per DataLoader worker to avoid
-    BadZipFile errors from concurrent access.
+    One sample = one frame of one camera of one scene.
 
     Args:
-        scene_zip_path: path to train_1.zip / test_seen.zip etc.
-        grasp_zip_path: path to grasp_label.zip
-        camera:         'realsense' or 'kinect'
-        num_points:     points to subsample per frame (standard: 25600)
-        num_frames:     frames per scene (None = all 256)
-        split:          'train' or 'val'
-        augment:        apply data augmentation
-        cache_dir:      where per-object best-grasp labels are cached
+        graspnet_root:    graspnetAPI dataset root
+        label_dir:        output dir of prepare_grasp_labels.py
+        scene_ids:        scene ids to use
+        cameras:          any of 'realsense', 'kinect'
+        num_points:       points to subsample per frame
+        frames_per_scene: frames per scene and camera, evenly spaced over 256
+        fric_coef_thresh: keep grasps with friction <= this (must be <= the
+                          value the labels were generated with)
+        grasp_radius:     max distance (m) from a scene point to a labelled
+                          grasp point for the point to get that point's grasps
+        augment:          apply data augmentation
+        split:            name used in log messages only
     """
 
     def __init__(
         self,
-        scene_zip_path: str,
-        grasp_zip_path: str,
-        camera:         str           = 'realsense',
-        num_points:     int           = 25600,
-        num_frames:     Optional[int] = 1,
-        split:          str           = 'train',
-        augment:        bool          = False,
-        cache_dir:      str           = 'data/graspnet/grasp_cache',
+        graspnet_root:    str,
+        label_dir:        str,
+        scene_ids:        List[int],
+        cameras:          Sequence[str] = ('realsense', 'kinect'),
+        num_points:       int   = 10000,
+        frames_per_scene: int   = 256,
+        fric_coef_thresh: float = 0.1,
+        grasp_radius:     float = 0.02,
+        augment:          bool  = False,
+        split:            str   = 'train',
     ):
-        self.scene_zip_path = scene_zip_path
-        self.grasp_zip_path = grasp_zip_path
-        self.camera         = camera
-        self.num_points     = num_points
-        self.num_frames     = num_frames
-        self.split          = split
-        self.augment        = augment
-        self.cache_dir      = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._grasp_cache   = {}
+        self.graspnet_root    = Path(graspnet_root)
+        self.label_dir        = Path(label_dir)
+        self.cameras          = list(cameras)
+        self.num_points       = num_points
+        self.fric_coef_thresh = fric_coef_thresh
+        self.grasp_radius     = grasp_radius
+        self.augment          = augment
 
-        # Open ZIP files temporarily just to build index
-        # Workers will open their own ZIP file handles in __getitem__
-        with zipfile.ZipFile(scene_zip_path, 'r') as z:
-            self._scene_names = set(z.namelist())
-        with zipfile.ZipFile(grasp_zip_path, 'r') as z:
-            self._grasp_names = set(z.namelist())
+        self.samples = [
+            (sid, camera, ann_id)
+            for sid in scene_ids
+            for camera in self.cameras
+            for ann_id in select_frames(frames_per_scene)
+        ]
 
-        # Per-worker ZIP handles — None until first __getitem__ call
-        self.scene_zip = None
-        self.grasp_zip = None
+        # Checked before GraspNet(), which reads every scene's files
+        missing = [
+            sid for sid in scene_ids
+            if not (self.label_dir / f'scene_{sid:04d}' / 'meta.npy').exists()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"[{split}] grasp labels missing for {len(missing)} scenes: "
+                f"{missing}. Run: python prepare_grasp_labels.py --config "
+                f"<your config>."
+            )
+        for sid in scene_ids:
+            label_thresh = np.load(
+                self.label_dir / f'scene_{sid:04d}' / 'meta.npy', allow_pickle=True
+            ).item()['fric_coef_thresh']
+            if fric_coef_thresh > label_thresh + 1e-6:
+                raise ValueError(
+                    f"scene_{sid:04d} labels keep friction <= {label_thresh}, "
+                    f"config asks for <= {fric_coef_thresh}. Re-run "
+                    f"prepare_grasp_labels.py with --overwrite."
+                )
 
-        self.scenes = self._get_scene_list()
+        self.graspnet = {
+            camera: GraspNet(graspnet_root, camera=camera, split='custom',
+                             sceneIds=scene_ids)
+            for camera in self.cameras
+        }
+        self.obj_ids = {
+            sid: self.graspnet[self.cameras[0]].getObjIds(sid) for sid in scene_ids
+        }
+        self.views = generate_views(NUM_VIEWS)
 
-        n_val = max(1, len(self.scenes) // 10)
-        if split == 'train':
-            self.scenes = self.scenes[:-n_val]
-        else:
-            self.scenes = self.scenes[-n_val:]
-
-        self.samples = self._build_sample_index()
+        # filled lazily, per DataLoader worker
+        self._labels       = {}
+        self._camera_poses = {}
 
         print(f"GraspNetDataset [{split}]: "
-              f"{len(self.scenes)} scenes, "
-              f"{len(self.samples)} samples, "
+              f"{len(scene_ids)} scenes x {len(self.cameras)} cameras x "
+              f"{frames_per_scene} frames = {len(self.samples)} samples, "
               f"{num_points} points per frame")
-
-    def _get_zips(self):
-        """
-        Open ZIP files lazily — once per worker process.
-        Called at the start of every __getitem__.
-        Each DataLoader worker gets its own file handles.
-        """
-        if self.scene_zip is None:
-            self.scene_zip = zipfile.ZipFile(self.scene_zip_path, 'r')
-        if self.grasp_zip is None:
-            self.grasp_zip = zipfile.ZipFile(self.grasp_zip_path, 'r')
-
-    def _get_scene_list(self) -> List[str]:
-        scenes = set()
-        for name in self._scene_names:
-            parts = name.split('/')
-            if parts[0].startswith('scene_'):
-                scenes.add(parts[0])
-        return sorted(list(scenes))
-
-    def _build_sample_index(self) -> List[Tuple[str, str]]:
-        samples = []
-        for scene in self.scenes:
-            depth_files = sorted([
-                n for n in self._scene_names
-                if f'{scene}/{self.camera}/depth/' in n
-                and n.endswith('.png')
-            ])
-            frame_ids = [Path(f).stem for f in depth_files]
-
-            if (self.num_frames is not None
-                    and len(frame_ids) > self.num_frames):
-                indices   = np.linspace(
-                    0, len(frame_ids) - 1,
-                    self.num_frames, dtype=int
-                )
-                frame_ids = [frame_ids[i] for i in indices]
-
-            for fid in frame_ids:
-                samples.append((scene, fid))
-
-        return samples
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict:
-        # Open ZIP files lazily per worker
-        self._get_zips()
+        scene_id, camera, ann_id = self.samples[idx]
+        frame = f'scene_{scene_id:04d} {camera} frame {ann_id:04d}'
 
-        scene_id, frame_id = self.samples[idx]
+        # ── 1. Load RGB-D through graspnetAPI ────────────────────────────
+        rgb_path, depth_path, seg_path, meta_path, _, _, _ = \
+            self.graspnet[camera].loadData(scene_id, camera, ann_id)
 
-        # ── 1. Load RGB-D ────────────────────────────────────────────────
-        depth, rgb, label, camK, camera_pose = self._load_rgbd(
-            scene_id, frame_id
-        )
+        rgb   = np.array(Image.open(rgb_path))
+        depth = np.array(Image.open(depth_path))
+        seg   = np.array(Image.open(seg_path))
+        meta  = scio.loadmat(meta_path)
 
         # ── 2. Back-project depth → point cloud ──────────────────────────
-        coords, colors = depth_to_pointcloud(depth, rgb, camK)
+        coords, colors = depth_to_pointcloud(
+            depth, rgb,
+            meta['intrinsic_matrix'],
+            meta['factor_depth'].item(),
+        )
 
         # ── 3. Remove invalid points (zero depth) ────────────────────────
-        valid      = coords[:, 2] > 0
-        coords     = coords[valid]
-        colors     = colors[valid]
-        label_flat = label.reshape(-1)[valid]
+        valid    = coords[:, 2] > 0
+        coords   = coords[valid]
+        colors   = colors[valid]
+        seg_flat = seg.reshape(-1)[valid]
 
         # ── 4. Random subsample to num_points ────────────────────────────
         N = len(coords)
@@ -427,236 +293,231 @@ class GraspNetDataset(Dataset):
                 np.arange(N),
                 np.random.choice(N, self.num_points - N, replace=True)
             ])
-        coords     = coords[indices]
-        colors     = colors[indices]
-        label_flat = label_flat[indices]
+        coords   = coords[indices]
+        colors   = colors[indices]
+        seg_flat = seg_flat[indices]
 
-        # ── 5. Normalize coordinates to [-1, 1] ──────────────────────────
-        centroid    = coords.mean(axis=0)
-        coords_norm = coords - centroid
-        scale       = np.abs(coords_norm).max()
-        if scale > 0:
-            coords_norm = coords_norm / scale
-            
-        coords_norm = np.clip(coords_norm, -1.0, 1.0)  # ← add here
-
-        norm_params = {'centroid': centroid, 'scale': scale}
-
-        # ── 6. Build per-object masks ────────────────────────────────────
-        obj_ids       = self._load_object_ids(scene_id)
+        # ── 5. Build per-object masks ────────────────────────────────────
         masks         = []
         valid_obj_ids = []
 
-        for obj_id in obj_ids:
-            # label png stores obj_id + 1 (0 = background), as in graspnetAPI
-            mask = (label_flat == obj_id + 1).astype(np.float32)
+        for obj_id in self.obj_ids[scene_id]:
+            # segmentation stores obj_id + 1 (0 = background), as in graspnetAPI
+            mask = seg_flat == obj_id + 1
             if mask.sum() > 10:
                 masks.append(mask)
                 valid_obj_ids.append(obj_id)
             else:
                 warnings.warn(
-                    f"{scene_id} frame {frame_id}: object {obj_id} dropped, "
+                    f"{frame}: object {obj_id} dropped, "
                     f"<= 10 of the {self.num_points} sampled points are on it"
                 )
 
         if len(masks) == 0:
             warnings.warn(
-                f"{scene_id} frame {frame_id}: no object has a usable mask, "
+                f"{frame}: no object has a usable mask, "
                 f"skipping to the next sample"
             )
             return self.__getitem__((idx + 1) % len(self))
 
-        masks = np.stack(masks, axis=0)  # [M, N]
+        masks = np.stack(masks, axis=0)  # [M, N] bool
 
-        # ── 7. Load grasp labels ─────────────────────────────────────────
-        grasp_labels = self._load_grasp_labels(
-            scene_id, frame_id,
-            valid_obj_ids,
-            coords, coords_norm,
-            camera_pose, norm_params,
-        )
+        # ── 6. Grasp points and per-object rotations in this camera view ─
+        grasp_points, obj_rotations = self._frame_poses(scene_id, camera, ann_id)
 
-        # ── 8. Augmentation ──────────────────────────────────────────────
+        # ── 7. Augmentation (applied to points AND grasp labels) ─────────
         if self.augment:
-            coords_norm, colors, masks = self._augment(
-                coords_norm, colors, masks
+            coords, colors, grasp_points, obj_rotations = self._augment(
+                coords, colors, grasp_points, obj_rotations
             )
 
-        # ── 9. Convert to tensors ────────────────────────────────────────
+        # ── 8. Normalize coordinates to [-1, 1] ──────────────────────────
+        centroid    = coords.mean(axis=0)
+        coords_norm = coords - centroid
+        scale       = np.abs(coords_norm).max()
+        if scale > 0:
+            coords_norm = coords_norm / scale
+        coords_norm = np.clip(coords_norm, -1.0, 1.0)
+
+        # ── 9. Assign grasps to points ───────────────────────────────────
+        grasps = self._assign_grasps(
+            frame, scene_id, coords, masks, valid_obj_ids,
+            grasp_points, obj_rotations,
+        )
+
+        # ── 10. Convert to tensors ───────────────────────────────────────
         return {
-            'coords':         torch.from_numpy(coords_norm).float(),
-            'features':       torch.from_numpy(colors).float(),
-            'masks':          torch.from_numpy(masks).float(),
-            'grasp_quality':  grasp_labels['quality'],
-            'grasp_rotation': grasp_labels['rotation'],
-            'grasp_width':    grasp_labels['width'],
-            'scene_id':       scene_id,
-            'frame_id':       frame_id,
-            'obj_ids':        valid_obj_ids,
+            'coords':          torch.from_numpy(coords_norm).float(),
+            'features':        torch.from_numpy(colors).float(),
+            'masks':           torch.from_numpy(masks).float(),
+            'grasp_quality':   grasps['quality'],
+            'grasp_point_idx': grasps['point_idx'],
+            'grasp_rotation':  grasps['rotation'],
+            'grasp_width':     grasps['width'],
+            'scene_id':        f'scene_{scene_id:04d}',
+            'camera':          camera,
+            'frame_id':        f'{ann_id:04d}',
+            'obj_ids':         valid_obj_ids,
         }
 
-    def _load_rgbd(
+    def _scene_labels(self, scene_id: int) -> Dict[str, np.ndarray]:
+        """Per-scene labels, memory-mapped (only the rows used are read)."""
+        if scene_id not in self._labels:
+            scene_dir = self.label_dir / f'scene_{scene_id:04d}'
+            self._labels[scene_id] = {
+                k: np.load(scene_dir / f'{k}.npy', mmap_mode='r')
+                for k in LABEL_FILES
+            }
+        return self._labels[scene_id]
+
+    def _frame_poses(
         self,
-        scene_id: str,
-        frame_id: str,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        base = f'{scene_id}/{self.camera}'
-
-        depth = np.array(Image.open(io.BytesIO(
-            self.scene_zip.read(f'{base}/depth/{frame_id}.png')
-        )))
-
-        rgb = np.array(Image.open(io.BytesIO(
-            self.scene_zip.read(f'{base}/rgb/{frame_id}.png')
-        )))
-
-        label = np.array(Image.open(io.BytesIO(
-            self.scene_zip.read(f'{base}/label/{frame_id}.png')
-        )))
-
-        camK = np.load(io.BytesIO(
-            self.scene_zip.read(f'{base}/camK.npy')
-        ))
-
-        poses       = np.load(io.BytesIO(
-            self.scene_zip.read(f'{base}/camera_poses.npy')
-        ))
-        camera_pose = poses[int(frame_id)]
-
-        return depth, rgb, label, camK, camera_pose
-
-    def _load_object_ids(self, scene_id: str) -> List[int]:
-        txt = self.scene_zip.read(
-            f'{scene_id}/object_id_list.txt'
-        ).decode().strip().split()
-        return [int(x) for x in txt]
-
-    def _get_best_grasps(
-        self,
-        obj_id: int,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        scene_id: int,
+        camera:   str,
+        ann_id:   int,
+    ) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
         """
-        Best grasp per surface point for one object, cached in memory and
-        on disk. Raw labels are up to ~2.3 GB per object, so they are
-        reduced once and never loaded again.
-        """
-        if obj_id in self._grasp_cache:
-            return self._grasp_cache[obj_id]
+        Step 4 of GraspNet.loadGrasp for this frame: object points from the
+        object frame into the camera view, and the rotation that does the
+        same for gripper rotations (same operations as loadGrasp).
 
-        label_path = f'grasp_label/{obj_id:03d}_labels.npz'
-        if label_path not in self._grasp_names:
-            warnings.warn(
-                f"object {obj_id}: {label_path} not found in grasp zip, "
-                f"it gets no grasp labels"
+        Returns:
+            grasp_points:  [K, 3] all labelled points of the scene, camera frame
+            obj_rotations: obj_id -> [3, 3], camera_R = obj_rotations[obj] @ R
+        """
+        key = (scene_id, camera)
+        if key not in self._camera_poses:
+            self._camera_poses[key] = np.load(
+                self.graspnet_root / 'scenes' / f'scene_{scene_id:04d}'
+                / camera / 'camera_poses.npy'
             )
-            return None
+        camera_pose = self._camera_poses[key][ann_id]
 
-        cache_path = self.cache_dir / f'{obj_id:03d}_best.npz'
-        if cache_path.exists():
-            c      = np.load(cache_path)
-            result = (c['points'], c['scores'], c['offsets'])
-        else:
-            print(f"Caching best grasps for object {obj_id:03d}...")
-            with self.grasp_zip.open(label_path) as f:
-                result = get_best_grasp_per_point(f)
-            tmp_path = cache_path.with_suffix('.tmp.npz')
-            np.savez(tmp_path, points=result[0],
-                     scores=result[1], offsets=result[2])
-            tmp_path.replace(cache_path)
+        xml = (self.graspnet_root / 'scenes' / f'scene_{scene_id:04d}' / camera
+               / 'annotations' / f'{ann_id:04d}.xml')
+        pose_vectors        = xmlReader(str(xml)).getposevectorlist()
+        obj_list, pose_list = get_obj_pose_list(camera_pose, pose_vectors)
+        inv_camera_pose     = np.linalg.inv(camera_pose)
 
-        self._grasp_cache[obj_id] = result
-        return result
+        labels        = self._scene_labels(scene_id)
+        point_obj_ids = np.asarray(labels['point_obj_ids'])
+        grasp_points  = np.zeros((len(point_obj_ids), 3), dtype=np.float32)
+        obj_rotations = {}
 
-    def _load_grasp_labels(
+        for obj_id, trans in zip(obj_list, pose_list):
+            sel = point_obj_ids == obj_id
+            pts = transform_points(np.asarray(labels['points'][sel]), trans)
+            grasp_points[sel]     = transform_points(pts, inv_camera_pose)
+            obj_rotations[obj_id] = inv_camera_pose[:3, :3] @ trans[:3, :3]
+
+        return grasp_points, obj_rotations
+
+    def _assign_grasps(
         self,
-        scene_id:      str,
-        frame_id:      str,
-        valid_obj_ids: List[int],
+        frame:         str,
+        scene_id:      int,
         coords:        np.ndarray,
-        coords_norm:   np.ndarray,
-        camera_pose:   np.ndarray,
-        norm_params:   Dict,
-    ) -> Dict:
-        N = coords.shape[0]
-        M = len(valid_obj_ids)
+        masks:         np.ndarray,
+        valid_obj_ids: List[int],
+        grasp_points:  np.ndarray,
+        obj_rotations: Dict[int, np.ndarray],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        For each object m, every point n on its mask is matched to the
+        nearest labelled grasp point of that object within grasp_radius,
+        and gets ALL grasps of that labelled point with friction
+        <= fric_coef_thresh.
 
-        quality  = np.zeros((M, N),    dtype=np.float32)
-        rotation = np.zeros((M, N, 6), dtype=np.float32)
-        width    = np.zeros((M, N, 1), dtype=np.float32)
+        Returns:
+            quality:   [M, N]  1.1 - lowest friction of the point's grasps,
+                               0 where the point has no grasp
+            point_idx: [T]     m * N + n of each grasp
+            rotation:  [T, 6]  6D rotation, camera frame
+            width:     [T]     gripper width (m)
+        """
+        M, N   = masks.shape
+        labels = self._scene_labels(scene_id)
 
-        ann_bytes = self.scene_zip.read(
-            f'{scene_id}/{self.camera}/annotations/{frame_id}.xml'
-        )
-        obj_poses = parse_annotation_xml(ann_bytes)
+        point_obj_ids = np.asarray(labels['point_obj_ids'])
+        point_offsets = np.asarray(labels['point_offsets'])
 
-        for m_idx, obj_id in enumerate(valid_obj_ids):
-            if obj_id not in obj_poses:
+        quality = np.zeros((M, N), dtype=np.float32)
+        out_idx, out_rot, out_width = [], [], []
+
+        for m, obj_id in enumerate(valid_obj_ids):
+            obj_points = np.flatnonzero(point_obj_ids == obj_id)
+            if len(obj_points) == 0:
                 warnings.warn(
-                    f"{scene_id} frame {frame_id}: object {obj_id} has no pose "
-                    f"in the annotation xml, it gets no grasp labels"
+                    f"{frame}: object {obj_id} has no grasp passing the "
+                    f"labels' friction threshold, it gets no grasp labels"
                 )
                 continue
 
-            best = self._get_best_grasps(obj_id)
-            if best is None:
-                continue
-            valid_pts, valid_scores, valid_off = best
-
-            pose  = obj_poses[obj_id]
-            R_obj = quaternion_to_matrix(pose['quat'])
-            t_obj = pose['pos']
-
-            if len(valid_pts) == 0:
-                warnings.warn(
-                    f"object {obj_id}: no collision-free grasp with score > 0, "
-                    f"it gets no grasp labels"
-                )
+            pts = np.flatnonzero(masks[m])
+            nn_idx, nn_dists = nearest_neighbor(coords[pts], grasp_points[obj_points])
+            close = nn_dists < self.grasp_radius ** 2
+            pts, k = pts[close], obj_points[nn_idx[close]]
+            if len(pts) == 0:
                 continue
 
-            valid_pts_world = valid_pts @ R_obj.T + t_obj
-            valid_pts_cam   = transform_points_to_camera(
-                valid_pts_world, camera_pose
+            # all grasps of each matched labelled point:
+            # grasps of point k are [point_offsets[k], point_offsets[k + 1])
+            starts = point_offsets[k]
+            counts = point_offsets[k + 1] - starts
+            n_rep  = np.repeat(pts, counts)
+            g_idx  = (np.repeat(starts - np.cumsum(counts) + counts, counts)
+                      + np.arange(counts.sum()))
+
+            fric = np.asarray(labels['grasp_fric'][g_idx])
+            keep = fric <= self.fric_coef_thresh + 1e-6
+            n_rep, g_idx, fric = n_rep[keep], g_idx[keep], fric[keep]
+            if len(g_idx) == 0:
+                continue
+
+            best_fric = np.full(N, np.inf, dtype=np.float32)
+            np.minimum.at(best_fric, n_rep, fric)
+            has = np.isfinite(best_fric)
+            quality[m, has] = 1.1 - best_fric[has]  # graspnetAPI score
+
+            # step 3 of loadGrasp, then into this camera view
+            R = batch_viewpoint_params_to_matrix(
+                -self.views[np.asarray(labels['grasp_views'][g_idx])],
+                np.asarray(labels['grasp_angles'][g_idx]),
             )
+            R = obj_rotations[obj_id][None] @ R
 
-            valid_pts_norm = (
-                valid_pts_cam - norm_params['centroid']
-            ) / norm_params['scale']
+            out_idx.append(m * N + n_rep)
+            out_rot.append(rotation_matrix_to_6d(R).astype(np.float32))
+            out_width.append(np.asarray(labels['grasp_widths'][g_idx]))
 
-            nn_idx, nn_dists = nearest_neighbor(
-                coords_norm, valid_pts_norm
-            )
-
-            threshold  = 0.02 / norm_params['scale']
-            close_mask = nn_dists < threshold ** 2
-
-            quality[m_idx, close_mask] = valid_scores[nn_idx[close_mask]]
-
-            offsets_assigned = valid_off[nn_idx[close_mask]]
-            if len(offsets_assigned) > 0:
-                norms    = np.linalg.norm(
-                    offsets_assigned, axis=-1, keepdims=True
-                )
-                norms    = np.maximum(norms, 1e-6)
-                approach = offsets_assigned / norms
-
-                R_grasp  = approach_to_rotation(approach)
-                r6d      = rotation_matrix_to_6d(R_grasp)
-                rotation[m_idx, close_mask] = r6d
-                width[m_idx, close_mask, 0] = norms.squeeze(-1)
+        if out_idx:
+            point_idx = np.concatenate(out_idx)
+            rotation  = np.concatenate(out_rot)
+            width     = np.concatenate(out_width)
+        else:
+            point_idx = np.zeros(0, dtype=np.int64)
+            rotation  = np.zeros((0, 6), dtype=np.float32)
+            width     = np.zeros(0, dtype=np.float32)
 
         return {
-            'quality':  torch.from_numpy(quality).float(),
-            'rotation': torch.from_numpy(rotation).float(),
-            'width':    torch.from_numpy(width).float(),
+            'quality':   torch.from_numpy(quality),
+            'point_idx': torch.from_numpy(point_idx.astype(np.int64)),
+            'rotation':  torch.from_numpy(rotation),
+            'width':     torch.from_numpy(width.astype(np.float32)),
         }
 
     def _augment(
         self,
-        coords:  np.ndarray,
-        colors:  np.ndarray,
-        masks:   np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Rotation around Z axis only — gravity direction preserved."""
+        coords:        np.ndarray,
+        colors:        np.ndarray,
+        grasp_points:  np.ndarray,
+        obj_rotations: Dict[int, np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[int, np.ndarray]]:
+        """
+        Random rotation around the camera Z axis through the point cloud
+        centroid, plus point and color jitter. Grasp points and grasp
+        rotations are rotated with the scene so labels stay consistent.
+        """
         angle        = np.random.uniform(0, 2 * np.pi)
         cos_a, sin_a = np.cos(angle), np.sin(angle)
         R_aug        = np.array([
@@ -664,14 +525,18 @@ class GraspNetDataset(Dataset):
             [sin_a,  cos_a, 0],
             [0,      0,     1],
         ], dtype=np.float32)
+        center = coords.mean(axis=0)
 
-        coords  = coords @ R_aug.T
-        coords += np.random.normal(
+        coords = (coords - center) @ R_aug.T + center
+        coords = coords + np.random.normal(
             0, 0.002, coords.shape
         ).astype(np.float32)
-        colors  = np.clip(
+        colors = np.clip(
             colors + np.random.normal(0, 0.02, colors.shape),
             0, 1
         ).astype(np.float32)
 
-        return coords, colors, masks
+        grasp_points  = (grasp_points - center) @ R_aug.T + center
+        obj_rotations = {o: R_aug @ R for o, R in obj_rotations.items()}
+
+        return coords, colors, grasp_points, obj_rotations

@@ -1,0 +1,78 @@
+# Short test run: 16 train / 8 val samples, 2 epochs.
+# python train.py --config configs/graspnet_test.yaml
+model:
+  pretrained_ckpt: "pretrained/pointsam/model.safetensors"
+  freeze_encoder: true
+  joint_mask_grasp: true
+
+  patch_embed:              # must be indented under model
+    in_channels: 6
+    out_channels: 512  # compatible with unit3d-l
+    num_patches: 1024
+    patch_size: 256
+
+  transformer:
+    model_name: "eva02_large_patch14_448"
+    pretrained: false
+
+  pc_encoder:
+    embed_dim: 256
+
+  point_encoder:
+    embed_dim: 256 
+
+  mask_encoder:
+    embed_dim: 256
+
+  mask_decoder:
+    transformer_dim: 256
+    depth: 2
+    num_heads: 8
+    mlp_dim: 2048
+
+  grasp_decoder:
+    transformer_dim: 256
+    depth: 2
+    num_heads: 8
+    mlp_dim: 2048
+    num_grasp_rot_tokens: 6
+    joint_mask_grasp: true
+
+  prompt_iters: 5
+
+training:
+  batch_size: 1
+  num_points: 10000
+  learning_rate: 3.0e-4        # confirmed from official large.yaml
+  weight_decay: 0.1            # confirmed from official large.yaml
+  max_epochs: 2                # short test run
+  max_grad_value: 1.0          # confirmed from official large.yaml
+  gradient_accumulation_steps: 1
+  mixed_precision: "fp16"      # essential for memory efficiency
+  gradient_checkpointing: true
+  output_dir: "checkpoints_test"
+  log_every_n_steps: 1
+  val_every_n_epochs: 1
+  save_freq: 1
+
+  scheduler:
+    milestones: [400000, 500000]  # confirmed from official large.yaml
+    warmup_iters: 3000
+    warmup_factor: 0.001
+    gamma: 0.1
+
+data:
+  graspnet_root: "/mnt/f/graspnet"       # graspnetAPI layout: scenes/, grasp_label/, collision_label/
+  label_dir: "data/graspnet_scene_labels"  # per-scene labels from prepare_grasp_labels.py
+  cameras: ["realsense", "kinect"]
+  train_scenes: [0, 2]                   # test: 2 scenes
+  val_scenes: [90, 91]                   # test: 1 scene
+  frames_per_scene: 4                    # test: 4 frames per camera
+  fric_coef_thresh: 0.1                  # as RGBD-Matter; lower = stricter (graspnetAPI default 0.4)
+  grasp_radius: 0.02                     # m, point -> nearest labelled grasp point
+  num_workers: 4
+  pin_memory: false                      # true on a GPU machine with plenty of RAM
+
+eval:
+  top_k_grasps: 50
+  iou_threshold: 0.25

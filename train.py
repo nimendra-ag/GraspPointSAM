@@ -9,12 +9,14 @@ Usage:
 """
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
+from safetensors.torch import save_model
 
 from grasp_point_sam.model.build_model import build_model
 from grasp_point_sam.data.graspnet_dataset import GraspNetDataset, scene_range
@@ -197,9 +199,14 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    # Output dir
-    output_dir = Path(cfg.training.output_dir)
+    # Output dir: one folder per run, named by start date and time;
+    # a resumed run keeps saving into the folder of its checkpoint
+    if args.resume:
+        output_dir = Path(args.resume).parent
+    else:
+        output_dir = Path(cfg.training.output_dir) / datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoints: {output_dir}")
 
     # Model
     print("Building model...")
@@ -273,18 +280,18 @@ def main():
         train_dataset,
         batch_size  = cfg.training.batch_size,
         shuffle     = True,
-        num_workers = 0,           # ← change from cfg.data.num_workers to 0
+        num_workers = cfg.data.num_workers,
         collate_fn  = collate_fn,
-        pin_memory  = False,       # ← disable pin_memory when num_workers=0
+        pin_memory  = cfg.data.pin_memory,
         drop_last   = True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size  = cfg.training.batch_size,
         shuffle     = False,
-        num_workers = 0,           # ← change to 0
+        num_workers = cfg.data.num_workers,
         collate_fn  = collate_fn,
-        pin_memory  = False,       # ← disable
+        pin_memory  = cfg.data.pin_memory,
     )
 
     print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
@@ -334,6 +341,8 @@ def main():
                     'scheduler':     scheduler.state_dict(),
                     'best_val_loss': best_val_loss,
                 }, output_dir / 'best_model.pth')
+                # weights only, for inference / sharing (no pickle)
+                save_model(model, str(output_dir / 'best_model.safetensors'))
                 print(f"Saved best model.")
 
     print("\nTraining complete.")

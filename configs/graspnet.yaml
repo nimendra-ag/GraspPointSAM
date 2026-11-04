@@ -69,6 +69,7 @@ data:
   fric_coef_thresh: 0.1                  # as RGBD-Matter; lower = stricter (graspnetAPI default 0.4)
   grasp_radius: 0.02                     # m, point -> nearest labelled grasp point
   num_workers: 4
+  pin_memory: false                      # true on a GPU machine with plenty of RAM
 
 eval:
   top_k_grasps: 50

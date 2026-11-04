@@ -126,7 +126,7 @@ timm==0.9.16
 torch==2.3.1+cu121
 torch_scatter==2.1.2+pt23cu121
 torchvision==0.18.1+cu121
-torkit3d @ file:///home/asus/GraspPointSAM/third_party/torkit3d
+torkit3d
 tqdm==4.70.1
 traitlets==5.16.1
 transforms3d==0.4.2

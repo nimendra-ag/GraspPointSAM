@@ -7,3 +7,5 @@ temp.py
 **.pth
 data-rgbdmatter/
 **.npy
+**.safetensors
+eval_results/

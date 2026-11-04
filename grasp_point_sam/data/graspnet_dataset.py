@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
+import open3d as o3d
 import scipy.io as scio
 import torch
 from PIL import Image
@@ -41,6 +42,8 @@ from graspnetAPI.utils.utils import generate_views, get_obj_pose_list, transform
 from graspnetAPI.utils.xmlhandler import xmlReader
 
 NUM_VIEWS = 300  # as in GraspNet.loadGrasp
+
+WORKSPACE_MARGIN = 0.02  # m, as graspnet-baseline's get_workspace_mask(outlier=0.02)
 
 LABEL_FILES = [
     'points', 'point_obj_ids', 'point_offsets',
@@ -161,6 +164,49 @@ def nearest_neighbor(
     return nn_idx.astype(np.int64), (dists ** 2).astype(np.float32)
 
 
+def voxel_downsample_indices(coords: np.ndarray, voxel_size: float) -> np.ndarray:
+    """
+    One random point per occupied voxel.
+
+    Args:
+        coords:     [N, 3]
+        voxel_size: voxel edge length (m)
+
+    Returns:
+        [V] indices into coords
+    """
+    perm = np.random.permutation(len(coords))  # random point per voxel, per epoch
+    q    = np.floor(coords[perm] / voxel_size).astype(np.int64)
+    q   -= q.min(axis=0)
+    dims = q.max(axis=0) + 1
+    key  = (q[:, 0] * dims[1] + q[:, 1]) * dims[2] + q[:, 2]
+    _, first = np.unique(key, return_index=True)
+    return perm[first]
+
+
+def farthest_point_indices(coords: np.ndarray, num_samples: int) -> np.ndarray:
+    """
+    Farthest point sampling (open3d, C++).
+
+    open3d returns points, not indices, so each point's index is carried
+    through in its normal and read back.
+
+    Args:
+        coords:      [N, 3], N >= num_samples
+        num_samples: points to keep
+
+    Returns:
+        [num_samples] indices into coords
+    """
+    pcd = o3d.geometry.PointCloud()
+    pcd.points  = o3d.utility.Vector3dVector(coords.astype(np.float64))
+    pcd.normals = o3d.utility.Vector3dVector(
+        np.repeat(np.arange(len(coords), dtype=np.float64)[:, None], 3, axis=1)
+    )
+    sampled = pcd.farthest_point_down_sample(num_samples)
+    return np.asarray(sampled.normals)[:, 0].astype(np.int64)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +228,14 @@ class GraspNetDataset(Dataset):
                           value the labels were generated with)
         grasp_radius:     max distance (m) from a scene point to a labelled
                           grasp point for the point to get that point's grasps
+        sampling:         'random': num_points random points;
+                          'fps': voxel downsample (voxel_size), then
+                          farthest point sampling to num_points
+        workspace_crop:   keep only points inside the objects' bounding box
+                          (table frame) + 2 cm, as graspnet-baseline; removes
+                          far background and depth outliers, which FPS
+                          would otherwise pick first
+        voxel_size:       voxel size (m) for sampling='fps'
         augment:          apply data augmentation
         split:            name used in log messages only
     """
@@ -196,15 +250,24 @@ class GraspNetDataset(Dataset):
         frames_per_scene: int   = 256,
         fric_coef_thresh: float = 0.1,
         grasp_radius:     float = 0.02,
+        sampling:         str   = 'random',
+        workspace_crop:   bool  = False,
+        voxel_size:       float = 0.005,
         augment:          bool  = False,
         split:            str   = 'train',
     ):
+        if sampling not in ('random', 'fps'):
+            raise ValueError(f"sampling must be 'random' or 'fps', got {sampling!r}")
+
         self.graspnet_root    = Path(graspnet_root)
         self.label_dir        = Path(label_dir)
         self.cameras          = list(cameras)
         self.num_points       = num_points
         self.fric_coef_thresh = fric_coef_thresh
         self.grasp_radius     = grasp_radius
+        self.sampling         = sampling
+        self.workspace_crop   = workspace_crop
+        self.voxel_size       = voxel_size
         self.augment          = augment
 
         self.samples = [
@@ -249,11 +312,14 @@ class GraspNetDataset(Dataset):
         # filled lazily, per DataLoader worker
         self._labels       = {}
         self._camera_poses = {}
+        self._align_mats   = {}
 
         print(f"GraspNetDataset [{split}]: "
               f"{len(scene_ids)} scenes x {len(self.cameras)} cameras x "
               f"{frames_per_scene} frames = {len(self.samples)} samples, "
-              f"{num_points} points per frame")
+              f"{num_points} points per frame, sampling={sampling}"
+              f"{f' (voxel {voxel_size} m)' if sampling == 'fps' else ''}, "
+              f"workspace_crop={workspace_crop}")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -284,15 +350,17 @@ class GraspNetDataset(Dataset):
         colors   = colors[valid]
         seg_flat = seg.reshape(-1)[valid]
 
-        # ── 4. Random subsample to num_points ────────────────────────────
-        N = len(coords)
-        if N > self.num_points:
-            indices = np.random.choice(N, self.num_points, replace=False)
+        # ── 4. Subsample to num_points ───────────────────────────────────
+        if self.workspace_crop:
+            keep     = self._workspace_mask(frame, scene_id, camera, ann_id, coords, seg_flat)
+            coords   = coords[keep]
+            colors   = colors[keep]
+            seg_flat = seg_flat[keep]
+
+        if self.sampling == 'fps':
+            indices = self._fps_indices(coords)
         else:
-            indices = np.concatenate([
-                np.arange(N),
-                np.random.choice(N, self.num_points - N, replace=True)
-            ])
+            indices = self._random_indices(len(coords))
         coords   = coords[indices]
         colors   = colors[indices]
         seg_flat = seg_flat[indices]
@@ -360,6 +428,64 @@ class GraspNetDataset(Dataset):
             'obj_ids':         valid_obj_ids,
         }
 
+    def _random_indices(self, N: int) -> np.ndarray:
+        """num_points random indices into N points (repeats if N is smaller)."""
+        if N > self.num_points:
+            return np.random.choice(N, self.num_points, replace=False)
+        return np.concatenate([
+            np.arange(N),
+            np.random.choice(N, self.num_points - N, replace=True)
+        ])
+
+    def _fps_indices(self, coords: np.ndarray) -> np.ndarray:
+        """Voxel downsample, then farthest point sampling to num_points."""
+        candidates = voxel_downsample_indices(coords, self.voxel_size)
+        if len(candidates) <= self.num_points:
+            # fewer voxels than points: keep all, pad randomly as 'random' does
+            return candidates[self._random_indices(len(candidates))]
+        return candidates[farthest_point_indices(coords[candidates], self.num_points)]
+
+    def _camera_pose(self, scene_id: int, camera: str, ann_id: int) -> np.ndarray:
+        """[4, 4] pose of the camera at frame ann_id w.r.t. the first frame."""
+        key = (scene_id, camera)
+        if key not in self._camera_poses:
+            self._camera_poses[key] = np.load(
+                self.graspnet_root / 'scenes' / f'scene_{scene_id:04d}'
+                / camera / 'camera_poses.npy'
+            )
+        return self._camera_poses[key][ann_id]
+
+    def _workspace_mask(
+        self,
+        frame:    str,
+        scene_id: int,
+        camera:   str,
+        ann_id:   int,
+        coords:   np.ndarray,
+        seg_flat: np.ndarray,
+    ) -> np.ndarray:
+        """
+        graspnet-baseline's get_workspace_mask: points inside the axis-aligned
+        bounding box of all object points in the table frame, + 2 cm.
+        """
+        key = (scene_id, camera)
+        if key not in self._align_mats:
+            self._align_mats[key] = np.load(
+                self.graspnet_root / 'scenes' / f'scene_{scene_id:04d}'
+                / camera / 'cam0_wrt_table.npy'
+            )
+        trans = self._align_mats[key] @ self._camera_pose(scene_id, camera, ann_id)
+
+        table_coords = coords @ trans[:3, :3].T + trans[:3, 3]
+        foreground   = table_coords[seg_flat > 0]
+        if len(foreground) == 0:
+            warnings.warn(f"{frame}: no object points, workspace crop skipped")
+            return np.ones(len(coords), dtype=bool)
+
+        lo = foreground.min(axis=0) - WORKSPACE_MARGIN
+        hi = foreground.max(axis=0) + WORKSPACE_MARGIN
+        return np.all((table_coords > lo) & (table_coords < hi), axis=1)
+
     def _scene_labels(self, scene_id: int) -> Dict[str, np.ndarray]:
         """Per-scene labels, memory-mapped (only the rows used are read)."""
         if scene_id not in self._labels:
@@ -385,15 +511,9 @@ class GraspNetDataset(Dataset):
             grasp_points:  [K, 3] all labelled points of the scene, camera frame
             obj_rotations: obj_id -> [3, 3], camera_R = obj_rotations[obj] @ R
         """
-        key = (scene_id, camera)
-        if key not in self._camera_poses:
-            self._camera_poses[key] = np.load(
-                self.graspnet_root / 'scenes' / f'scene_{scene_id:04d}'
-                / camera / 'camera_poses.npy'
-            )
-        camera_pose = self._camera_poses[key][ann_id]
+        camera_pose = self._camera_pose(scene_id, camera, ann_id)
 
-        xml = (self.graspnet_root / 'scenes' / f'scene_{scene_id:04d}' / camera
+        xml =(self.graspnet_root / 'scenes' / f'scene_{scene_id:04d}' / camera
                / 'annotations' / f'{ann_id:04d}.xml')
         pose_vectors        = xmlReader(str(xml)).getposevectorlist()
         obj_list, pose_list = get_obj_pose_list(camera_pose, pose_vectors)

@@ -32,6 +32,9 @@ def parse_args():
     parser.add_argument('--config',     type=str, default='configs/graspnet.yaml')
     parser.add_argument('--resume',     type=str, default=None)
     parser.add_argument('--save',       type=bool, default=True)
+    # end this run before max_epochs (exclusive); the LR schedule still spans
+    # max_epochs, so training can be continued later with --resume
+    parser.add_argument('--stop_epoch', type=int, default=None)
     return parser.parse_args()
 
 
@@ -262,6 +265,9 @@ def main():
         frames_per_scene = cfg.data.frames_per_scene,
         fric_coef_thresh = cfg.data.fric_coef_thresh,
         grasp_radius     = cfg.data.grasp_radius,
+        sampling         = cfg.data.get('sampling', 'random'),
+        workspace_crop   = cfg.data.get('workspace_crop', False),
+        voxel_size       = cfg.data.get('voxel_size', 0.005),
     )
     train_dataset = GraspNetDataset(
         scene_ids = scene_range(cfg.data.train_scenes),
@@ -294,11 +300,16 @@ def main():
         pin_memory  = cfg.data.pin_memory,
     )
 
+    end_epoch = cfg.training.max_epochs
+    if args.stop_epoch is not None:
+        end_epoch = min(end_epoch, args.stop_epoch)
+
     print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+    print(f"Epochs {start_epoch}-{end_epoch - 1} of {cfg.training.max_epochs}")
     print("-" * 60)
 
     # Training loop
-    for epoch in range(start_epoch, cfg.training.max_epochs):
+    for epoch in range(start_epoch, end_epoch):
         print(f"\nEpoch {epoch}/{cfg.training.max_epochs} | LR: {scheduler.get_last_lr()[0]:.2e}")
         print("-" * 60)
 
@@ -309,8 +320,9 @@ def main():
         scheduler.step()
         print(f"Train Loss: {train_loss:.4f}")
 
-        # Validate
-        if epoch % cfg.training.val_every_n_epochs == 0:
+        # Validate (also on the last epoch of this run, to judge whether to resume)
+        is_last = epoch == end_epoch - 1
+        if epoch % cfg.training.val_every_n_epochs == 0 or is_last:
             val_loss = validate(model, criterion, val_loader, device, cfg)
             print(f"Val Loss:   {val_loss:.4f}")
 
@@ -322,7 +334,8 @@ def main():
             is_best = False
 
         # Save
-        if args.save and (epoch % cfg.training.save_freq == 0 or is_best):
+        # always save the last epoch of this run so it can be resumed
+        if args.save and (epoch % cfg.training.save_freq == 0 or is_best or is_last):
             ckpt_path = output_dir / f'checkpoint_epoch_{epoch:04d}.pth'
             torch.save({
                 'epoch':         epoch,

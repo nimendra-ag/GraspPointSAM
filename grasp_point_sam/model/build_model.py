@@ -78,6 +78,8 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         transformer_dim = m.grasp_decoder.transformer_dim,
         joint_mask_grasp = m.grasp_decoder.joint_mask_grasp,
         num_grasp_rot_tokens = m.grasp_decoder.num_grasp_rot_tokens,
+        # 0 for configs / checkpoints from before the depth head
+        num_depth_bins = m.grasp_decoder.get('num_depth_bins', 0),
     )
 
     # Assemble GraspPointSAM 

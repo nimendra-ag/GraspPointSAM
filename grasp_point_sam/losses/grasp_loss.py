@@ -25,6 +25,8 @@ import torch.nn.functional as F
 from torch_scatter import scatter_min
 from typing import Dict, List, Optional, Tuple
 
+from grasp_point_sam.model.grasp_decoder import GRASP_DEPTHS
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core loss primitives
@@ -167,15 +169,23 @@ def weighted_mse(
     return fore_loss + bg_weight * back_loss
 
 
+def depth_to_bin(depth: torch.Tensor) -> torch.Tensor:
+    """Gripper depth (m) -> index of the nearest value in GRASP_DEPTHS."""
+    bins = torch.tensor(GRASP_DEPTHS, device=depth.device, dtype=torch.float32)
+    return (depth.float()[:, None] - bins[None]).abs().argmin(dim=1)
+
+
 def nearest_grasp_loss(
     pred_rotation: torch.Tensor,
     pred_width:    torch.Tensor,
     point_idx:     torch.Tensor,
     gt_rotation:   torch.Tensor,
     gt_width:      torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    pred_depth:    Optional[torch.Tensor] = None,
+    gt_depth:      Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Rotation and width loss when a point has several valid grasps.
+    Rotation, width and depth loss when a point has several valid grasps.
 
     Each labelled point is compared with ALL of its ground-truth grasps
     and only the closest one (smallest rotation error) is penalised, so
@@ -183,6 +193,7 @@ def nearest_grasp_loss(
     grasp would instead pull the prediction towards the average of
     several valid rotations, which is often not a valid grasp.
     Same idea as Contact-GraspNet's min-over-ground-truth loss.
+    Width and depth are supervised with that same closest grasp.
 
     Args:
         pred_rotation: [B*M, N, 6] predicted 6D rotation
@@ -190,9 +201,13 @@ def nearest_grasp_loss(
         point_idx:     [T] flat index (into B*M*N) of each ground-truth grasp
         gt_rotation:   [T, 6] 6D rotation of each ground-truth grasp
         gt_width:      [T]    width of each ground-truth grasp
+        pred_depth:    [B*M, N, num_depth_bins] depth logits, or None
+                       (model without a depth head)
+        gt_depth:      [T]    depth (m) of each ground-truth grasp, or None
 
     Returns:
-        rotation_loss, width_loss (scalars)
+        rotation_loss, width_loss, depth_loss (scalars; depth_loss is 0
+        without a depth head)
     """
     if point_idx.numel() == 0:
         warnings.warn(
@@ -200,7 +215,7 @@ def nearest_grasp_loss(
             "grasp, rotation and width loss are 0 for this batch"
         )
         zero = pred_rotation.sum() * 0.0
-        return zero, zero
+        return zero, zero, zero
 
     pred_rot = pred_rotation.reshape(-1, 6)[point_idx].float()      # [T, 6]
     rot_err  = (pred_rot - gt_rotation.float()).square().mean(-1)   # [T]
@@ -214,7 +229,13 @@ def nearest_grasp_loss(
     pred_w     = pred_width.reshape(-1)[point_idx[best]].float()    # [U]
     width_loss = F.mse_loss(pred_w, gt_width[best].float())
 
-    return rotation_loss, width_loss
+    if pred_depth is not None and gt_depth is not None:
+        logits     = pred_depth.reshape(-1, pred_depth.shape[-1])[point_idx[best]].float()
+        depth_loss = F.cross_entropy(logits, depth_to_bin(gt_depth[best]))
+    else:
+        depth_loss = rotation_loss * 0.0
+
+    return rotation_loss, width_loss, depth_loss
 
 
 def compute_iou(
@@ -338,6 +359,7 @@ class GraspPointSAMLoss(nn.Module):
         quality_scale:  float = 1.0,
         rotation_scale: float = 1.0,
         width_scale:    float = 1.0,
+        depth_scale:    float = 1.0,
         joint_mask_grasp: bool = True,
         use_soft_iou:   bool  = True,
     ):
@@ -347,6 +369,7 @@ class GraspPointSAMLoss(nn.Module):
         self.quality_scale  = quality_scale
         self.rotation_scale = rotation_scale
         self.width_scale    = width_scale
+        self.depth_scale    = depth_scale
         self.joint_mask_grasp = joint_mask_grasp
         self.use_soft_iou   = use_soft_iou
 
@@ -359,6 +382,7 @@ class GraspPointSAMLoss(nn.Module):
         gt_rotation: torch.Tensor, # [T, 6] 6D rotation of each gt grasp
         gt_width:    torch.Tensor, # [T] width of each gt grasp
         valid:       Optional[torch.Tensor] = None,  # [B*M] bool, False = padding
+        gt_depth:    Optional[torch.Tensor] = None,  # [T] depth (m) of each gt grasp
     ) -> Dict[str, torch.Tensor]:
         """
         Compute total loss over all prompt iterations.
@@ -380,6 +404,8 @@ class GraspPointSAMLoss(nn.Module):
             valid:       [B*M] bool, False for objects padded in by
                          collate_fn when batch_size > 1. These rows are
                          dropped so padding never affects the loss.
+            gt_depth:    [T] gripper depth of each ground-truth grasp; used
+                         when the model has a depth head
 
         Returns:
             dict with 'loss' (scalar) and sub-losses for logging
@@ -397,12 +423,14 @@ class GraspPointSAMLoss(nn.Module):
 
             # before padding rows are dropped: grasp_point_idx indexes the
             # full B*M*N layout
-            rotation_loss, width_loss = nearest_grasp_loss(
+            rotation_loss, width_loss, depth_loss = nearest_grasp_loss(
                 pred_rotation = predictions.grasp_rotation,  # [B*M, N, 6]
                 pred_width    = predictions.grasp_width,     # [B*M, N, 1]
                 point_idx     = grasp_point_idx,             # [T]
                 gt_rotation   = gt_rotation,                 # [T, 6]
                 gt_width      = gt_width,                    # [T]
+                pred_depth    = predictions.grasp_depth,     # [B*M, N, 4] or None
+                gt_depth      = gt_depth,                    # [T] or None
             )
 
             if valid is not None:
@@ -426,7 +454,8 @@ class GraspPointSAMLoss(nn.Module):
             grasp_loss = (
                 self.quality_scale  * quality_loss  +
                 self.rotation_scale * rotation_loss +
-                self.width_scale    * width_loss
+                self.width_scale    * width_loss    +
+                self.depth_scale    * depth_loss
             )
 
             # ── Mask losses (joint mode, from PointSAM) ──────────────────
@@ -490,6 +519,7 @@ class GraspPointSAMLoss(nn.Module):
                 'quality_loss':  quality_loss.item(),
                 'rotation_loss': rotation_loss.item(),
                 'width_loss':    width_loss.item(),
+                'depth_loss':    depth_loss.item(),
                 'mask_loss':     mask_loss.item()
                                  if isinstance(mask_loss, torch.Tensor)
                                  else mask_loss,

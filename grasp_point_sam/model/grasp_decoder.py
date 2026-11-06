@@ -20,6 +20,9 @@ from dataclasses import dataclass
 from .common import interpolate_features, compute_interp_weights, repeat_interleave
 from .mask_decoder import AuxInputs, MLP
 
+# Gripper depths of GraspNet-1Billion grasps (m); the depth head picks one
+GRASP_DEPTHS = (0.01, 0.02, 0.03, 0.04)
+
 # Data container for decoder outputs
 @dataclass
 class GraspPredictions:
@@ -52,12 +55,18 @@ class GraspPredictions:
     iou_preds : [B*M, num_masks] or None
         IoU predictions for mask quality estimation.
         Only populated when joint_mask_grasp=True.
+
+    grasp_depth : [B*M, N, num_depth_bins] or None
+        Per-point gripper depth logits, one per depth in GRASP_DEPTHS
+        (how far the gripper moves past the point along the approach).
+        Only populated when num_depth_bins > 0.
     """
     grasp_quality: torch.Tensor     # [B*M, N]
     grasp_rotation: torch.Tensor    # [B*M, N, 6]
     grasp_width: torch.Tensor       # [B*M, N, 1]
     masks: Optional[torch.Tensor]   # [B*M, N] or None
     iou_preds: Optional[torch.Tensor] # [B*M, num_masks] or None
+    grasp_depth: Optional[torch.Tensor] = None  # [B*M, N, num_depth_bins] or None
 
 
 # Small MLP used for per-point prediction heads
@@ -116,7 +125,8 @@ class GraspDecoder3D(nn.Module):
     How it works (step by step):
     
     1. TOKENS: Concatenate learnable tokens:
-       [iou_token | mask_tokens | grasp_quality_token | grasp_rotation_tokens | grasp_width_token]
+       [iou_token | mask_tokens | grasp_quality_token | grasp_rotation_tokens | grasp_width_token
+        | grasp_depth_tokens (when num_depth_bins > 0)]
        These tokens will "attend" to the point cloud embeddings via cross-attention.
     
     2. TRANSFORMER: Run TwoWayTransformer — tokens and point cloud embeddings
@@ -136,6 +146,9 @@ class GraspDecoder3D(nn.Module):
         num_grasp_rot_tokens : number of tokens for rotation prediction.
                                We use 6 tokens (one per rotation output dimension)
                                so each token specializes in one component.
+        num_depth_bins : number of gripper depths to classify (4 = GRASP_DEPTHS,
+                         as GraspNet-baseline / GSNet). 0 = no depth head
+                         (models trained before the depth head was added).
     """
 
     # Number of mask tokens (kept same as original SAM for compatibility)
@@ -147,13 +160,18 @@ class GraspDecoder3D(nn.Module):
         transformer_dim: int = 256,
         joint_mask_grasp: bool = True,
         num_grasp_rot_tokens: int = 6,
+        num_depth_bins: int = 0,
     ):
         super().__init__()
+        if num_depth_bins not in (0, len(GRASP_DEPTHS)):
+            raise ValueError(
+                f"num_depth_bins must be 0 or {len(GRASP_DEPTHS)}, got {num_depth_bins}")
 
         self.transformer = transformer
         self.transformer_dim = transformer_dim
         self.joint_mask_grasp = joint_mask_grasp
         self.num_grasp_rot_tokens = num_grasp_rot_tokens
+        self.num_depth_bins = num_depth_bins
 
         # Mask tokens (from original SAM, kept for joint mode)
         # iou_token: 1 token that predicts mask IoU quality
@@ -172,6 +190,11 @@ class GraspDecoder3D(nn.Module):
 
         # 1 token -> predicts per-point gripper width
         self.grasp_width_token = nn.Embedding(1, transformer_dim)
+
+        # num_depth_bins tokens -> per-point logit of each gripper depth
+        # (one token per depth, same pattern as the rotation tokens)
+        if num_depth_bins > 0:
+            self.grasp_depth_tokens = nn.Embedding(num_depth_bins, transformer_dim)
 
         # MLP heads (hypernetwork pattern) 
         # Each MLP takes a token embedding [D] -> weight vector
@@ -204,6 +227,18 @@ class GraspDecoder3D(nn.Module):
             output_dim=transformer_dim,
             num_layers=3,
         )
+
+        # Depth heads: one MLP per depth token, 1 logit per point each
+        if num_depth_bins > 0:
+            self.depth_heads = nn.ModuleList([
+                GraspMLP(
+                    input_dim=transformer_dim,
+                    hidden_dim=transformer_dim,
+                    output_dim=transformer_dim,
+                    num_layers=3,
+                )
+                for _ in range(num_depth_bins)
+            ])
 
         # Mask output MLP heads (joint mode only) 
         # Same pattern as original SAM mask decoder
@@ -277,6 +312,13 @@ class GraspDecoder3D(nn.Module):
                 self.grasp_width_token.weight,     # [1, D]
             ], dim=0)  # [8, D]
 
+        # Depth tokens go last, so the indices of the tokens above stay the same
+        num_base_tokens = output_tokens.shape[0]
+        if self.num_depth_bins > 0:
+            output_tokens = torch.cat(
+                [output_tokens, self.grasp_depth_tokens.weight], dim=0
+            )  # [num_base_tokens + num_depth_bins, D]
+
         # Expand tokens to match batch*instances dimension
         # sparse_prompt_embeddings has shape [B*M, K, D]
         # so we expand tokens to [B*M, num_tokens, D]
@@ -313,6 +355,9 @@ class GraspDecoder3D(nn.Module):
             quality_tok      = hs[:, 0, :]        # [B*M, D]
             rotation_toks    = hs[:, 1:7, :]      # [B*M, 6, D]
             width_tok        = hs[:, 7, :]         # [B*M, D]
+
+        if self.num_depth_bins > 0:
+            depth_toks = hs[:, num_base_tokens:num_base_tokens + self.num_depth_bins, :]
 
         #  Step 5: Interpolate patch features -> point features 
         # src is patch-level [B*M, L, D]. We need point-level [B*M, N, D].
@@ -368,6 +413,14 @@ class GraspDecoder3D(nn.Module):
         ).unsqueeze(-1)  # [B*M, N, 1]
         grasp_width   = F.softplus(grasp_width)  # ensure positive width
 
+        # Depth: one logit per depth bin -> [B*M, N, num_depth_bins]
+        grasp_depth = None
+        if self.num_depth_bins > 0:
+            grasp_depth = torch.stack([
+                torch.einsum('bd,bnd->bn', head(depth_toks[:, i, :]), point_features)
+                for i, head in enumerate(self.depth_heads)
+            ], dim=-1)
+
         #  Step 7: Mask prediction (joint mode only) 
         masks     = None
         iou_preds = None
@@ -403,4 +456,5 @@ class GraspDecoder3D(nn.Module):
             grasp_width    = grasp_width,     # [B*M, N, 1]
             masks          = masks,           # [B*M, num_masks, N] or None
             iou_preds      = iou_preds,       # [B*M, num_masks] or None
+            grasp_depth    = grasp_depth,     # [B*M, N, num_depth_bins] or None
         )

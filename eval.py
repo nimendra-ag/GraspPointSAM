@@ -12,8 +12,8 @@ Two stages (both by default):
 Settings of this first version:
   - prompts: one click per object, from the ground-truth segmentation
     (5 refinement iterations, as in training / validation)
-  - gripper depth: fixed (--depth, default 0.02 m); the model does not
-    predict depth yet
+  - gripper depth: predicted by the depth head; checkpoints from before
+    the depth head use a fixed depth (--depth, default 0.02 m)
   - grasp per point on the predicted mask: translation = the point
     (camera frame), rotation = predicted 6D, width = predicted,
     score = predicted quality
@@ -66,6 +66,7 @@ from grasp_point_sam.data.graspnet_dataset import (
     voxel_downsample_indices,
 )
 from grasp_point_sam.model.build_model import build_model
+from grasp_point_sam.model.grasp_decoder import GRASP_DEPTHS
 
 FRICTION_COEFS = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2]  # graspnetAPI's list
 TOP_K          = 50                              # graspnetAPI default
@@ -140,7 +141,20 @@ def rotation_6d_to_matrix(r: np.ndarray) -> np.ndarray:
 # Stage 1: predict
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_model(cfg, ckpt: str, device: str):
+def checkpoint_has_depth_head(ckpt: str) -> bool:
+    """True if the checkpoint was trained with the depth head."""
+    if ckpt.endswith('.safetensors'):
+        from safetensors import safe_open
+        with safe_open(ckpt, framework='pt') as f:
+            keys = list(f.keys())
+    else:
+        keys = list(torch.load(ckpt, map_location='cpu')['model'].keys())
+    return any(k.startswith('grasp_decoder.depth_heads') for k in keys)
+
+
+def load_model(cfg, ckpt: str, device: str, has_depth: bool):
+    # build the architecture the checkpoint was trained with
+    cfg.model.grasp_decoder.num_depth_bins = len(GRASP_DEPTHS) if has_depth else 0
     model = build_model(cfg)
     if ckpt.endswith('.safetensors'):
         from safetensors.torch import load_model as load_safetensors
@@ -148,7 +162,7 @@ def load_model(cfg, ckpt: str, device: str):
     else:
         state = torch.load(ckpt, map_location='cpu')
         model.load_state_dict(state['model'], strict=True)
-    print(f"Loaded checkpoint: {ckpt}")
+    print(f"Loaded checkpoint: {ckpt} (depth head: {'yes' if has_depth else 'no'})")
     return model.to(device).eval()
 
 
@@ -200,6 +214,10 @@ def predict_frame(model, args, root: Path, scene_id: int, camera: str,
     rotation = pred.grasp_rotation.float().cpu().numpy()      # [M, N, 6]
     width    = pred.grasp_width.float().cpu().numpy()[..., 0]  # [M, N]
     pred_msk = pred.masks.float().cpu().numpy()[:, 0] > 0     # [M, N]
+    if pred.grasp_depth is not None:                           # [M, N] in m
+        depth = np.asarray(GRASP_DEPTHS)[pred.grasp_depth.float().argmax(-1).cpu().numpy()]
+    else:
+        depth = np.full(quality.shape, args.depth)
 
     grasps = []
     for m, obj_id in enumerate(obj_ids):
@@ -212,7 +230,7 @@ def predict_frame(model, args, root: Path, scene_id: int, camera: str,
         g[:, 0]     = quality[m, pts]
         g[:, 1]     = width[m, pts]
         g[:, 2]     = GRASP_HEIGHT
-        g[:, 3]     = args.depth
+        g[:, 3]     = depth[m, pts]
         g[:, 4:13]  = R.reshape(-1, 9)
         g[:, 13:16] = coords[pts]
         g[:, 16]    = obj_id
@@ -231,7 +249,7 @@ def predict_frame(model, args, root: Path, scene_id: int, camera: str,
 
 def run_predict(args, cfg, scene_ids, ann_ids, dump_dir: Path):
     device = 'cuda'
-    model  = load_model(cfg, args.ckpt, device)
+    model  = load_model(cfg, args.ckpt, device, args.has_depth)
     root   = Path(args.graspnet_root)
 
     jobs = [(s, c, a) for s in scene_ids for c in args.cameras for a in ann_ids]
@@ -378,14 +396,15 @@ def main():
                    help='default: from the config; must match training')
     p.add_argument('--workspace_crop', action='store_true',
                    help='crop as in training (use if the model was trained with it)')
-    p.add_argument('--depth', type=float, default=0.02, help='fixed gripper depth (m)')
+    p.add_argument('--depth', type=float, default=0.02,
+                   help='fixed gripper depth (m), only for checkpoints without a depth head')
     p.add_argument('--grasps_per_object', type=int, default=100,
                    help='grasps kept per object after NMS')
     p.add_argument('--proc', type=int, default=2, help='processes for the eval stage')
     p.add_argument('--no_fp16', dest='fp16', action='store_false')
     p.add_argument('--overwrite', action='store_true', help='re-predict existing dumps')
     p.add_argument('--out_dir', default=None,
-                   help='default: eval_results/<checkpoint folder>_<sampling>_d<depth>')
+                   help='default: eval_results/<checkpoint folder>_<sampling>_<dpred or d<depth>>')
     args = p.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -393,19 +412,22 @@ def main():
     args.num_points    = cfg.training.num_points
     args.voxel_size    = cfg.data.get('voxel_size', 0.005)
     args.sampling      = args.sampling or cfg.data.get('sampling', 'random')
+    args.has_depth     = checkpoint_has_depth_head(args.ckpt)
+    depth_tag          = 'dpred' if args.has_depth else f'd{args.depth}'
 
     scene_ids = list(range(*args.scenes))
     ann_ids   = list(range(0, 256, args.frame_step))
 
     out_dir = Path(args.out_dir or
-                   f'eval_results/{Path(args.ckpt).parent.name}_{args.sampling}_d{args.depth}')
+                   f'eval_results/{Path(args.ckpt).parent.name}_{args.sampling}_{depth_tag}')
     dump_dir = out_dir / 'dump'
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Scenes {scene_ids[0]}-{scene_ids[-1]} ({len(scene_ids)}), "
           f"{len(ann_ids)} frames each, cameras {args.cameras}")
     print(f"sampling={args.sampling}, workspace_crop={args.workspace_crop}, "
-          f"depth={args.depth} m, output: {out_dir}")
+          f"depth={'predicted' if args.has_depth else f'fixed {args.depth} m'}, "
+          f"output: {out_dir}")
 
     if args.stage in ('all', 'predict'):
         run_predict(args, cfg, scene_ids, ann_ids, dump_dir)

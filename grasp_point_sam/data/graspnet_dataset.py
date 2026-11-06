@@ -17,7 +17,8 @@ Per sample:
     - per-object, per-point grasp quality (1.1 - lowest friction of the
       point's grasps; 0 = no grasp)
     - every grasp of every labelled point as a flat list
-      (grasp_point_idx, grasp_rotation, grasp_width), see _assign_grasps
+      (grasp_point_idx, grasp_rotation, grasp_width, grasp_depth),
+      see _assign_grasps
 
 graspnet_root must follow graspnetAPI's layout:
     <graspnet_root>/scenes/scene_XXXX/<camera>/{rgb,depth,label,meta,annotations}/
@@ -422,6 +423,7 @@ class GraspNetDataset(Dataset):
             'grasp_point_idx': grasps['point_idx'],
             'grasp_rotation':  grasps['rotation'],
             'grasp_width':     grasps['width'],
+            'grasp_depth':     grasps['depth'],
             'scene_id':        f'scene_{scene_id:04d}',
             'camera':          camera,
             'frame_id':        f'{ann_id:04d}',
@@ -554,6 +556,7 @@ class GraspNetDataset(Dataset):
             point_idx: [T]     m * N + n of each grasp
             rotation:  [T, 6]  6D rotation, camera frame
             width:     [T]     gripper width (m)
+            depth:     [T]     gripper depth (m), one of 0.01 / 0.02 / 0.03 / 0.04
         """
         M, N   = masks.shape
         labels = self._scene_labels(scene_id)
@@ -562,7 +565,7 @@ class GraspNetDataset(Dataset):
         point_offsets = np.asarray(labels['point_offsets'])
 
         quality = np.zeros((M, N), dtype=np.float32)
-        out_idx, out_rot, out_width = [], [], []
+        out_idx, out_rot, out_width, out_depth = [], [], [], []
 
         for m, obj_id in enumerate(valid_obj_ids):
             obj_points = np.flatnonzero(point_obj_ids == obj_id)
@@ -609,21 +612,25 @@ class GraspNetDataset(Dataset):
             out_idx.append(m * N + n_rep)
             out_rot.append(rotation_matrix_to_6d(R).astype(np.float32))
             out_width.append(np.asarray(labels['grasp_widths'][g_idx]))
+            out_depth.append(np.asarray(labels['grasp_depths'][g_idx]))
 
         if out_idx:
             point_idx = np.concatenate(out_idx)
             rotation  = np.concatenate(out_rot)
             width     = np.concatenate(out_width)
+            depth     = np.concatenate(out_depth)
         else:
             point_idx = np.zeros(0, dtype=np.int64)
             rotation  = np.zeros((0, 6), dtype=np.float32)
             width     = np.zeros(0, dtype=np.float32)
+            depth     = np.zeros(0, dtype=np.float32)
 
         return {
             'quality':   torch.from_numpy(quality),
             'point_idx': torch.from_numpy(point_idx.astype(np.int64)),
             'rotation':  torch.from_numpy(rotation),
             'width':     torch.from_numpy(width.astype(np.float32)),
+            'depth':     torch.from_numpy(depth.astype(np.float32)),
         }
 
     def _augment(

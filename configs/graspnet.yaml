@@ -34,6 +34,7 @@ model:
     num_heads: 8
     mlp_dim: 2048
     num_grasp_rot_tokens: 6
+    num_depth_bins: 4           # gripper depth classes 0.01-0.04 m (0 = no depth head)
     joint_mask_grasp: true
 
   prompt_iters: 5

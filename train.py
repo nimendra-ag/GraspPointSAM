@@ -52,6 +52,7 @@ def collate_fn(batch):
     point_idx_list = []
     rotation_list  = []
     width_list     = []
+    depth_list     = []
     valid_list     = []
 
     for b, s in enumerate(batch):
@@ -75,6 +76,7 @@ def collate_fn(batch):
         point_idx_list.append(s['grasp_point_idx'] + b * max_M * N)
         rotation_list.append(s['grasp_rotation'])
         width_list.append(s['grasp_width'])
+        depth_list.append(s['grasp_depth'])
 
         # False for padded (fake) objects so the loss can ignore them
         valid_list.append(torch.arange(max_M) < M)
@@ -87,6 +89,7 @@ def collate_fn(batch):
         'grasp_point_idx': torch.cat(point_idx_list),
         'grasp_rotation':  torch.cat(rotation_list),
         'grasp_width':     torch.cat(width_list),
+        'grasp_depth':     torch.cat(depth_list),
         'mask_valid':      torch.stack(valid_list),
     }
 
@@ -107,6 +110,7 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, epoch, 
         gt_point    = batch['grasp_point_idx'].to(device)
         gt_rotation = batch['grasp_rotation'].to(device)
         gt_width    = batch['grasp_width'].to(device)
+        gt_depth    = batch['grasp_depth'].to(device)
         mask_valid  = batch['mask_valid'].to(device)
 
         # Flatten B*M
@@ -126,6 +130,7 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, epoch, 
                 gt_rotation  = gt_rotation,
                 gt_width     = gt_width,
                 valid        = mask_valid_flat,
+                gt_depth     = gt_depth,
             )
 
         loss = loss_dict['loss']
@@ -145,6 +150,7 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, epoch, 
                 f"Epoch [{epoch}] Step [{step}/{len(loader)}] "
                 f"Loss: {loss.item():.4f} | "
                 f"Grasp: {it['grasp_loss']:.4f} | "
+                f"Depth: {it['depth_loss']:.4f} | "
                 f"Mask: {it['mask_loss']:.4f}"
             )
 
@@ -168,6 +174,7 @@ def validate(model, criterion, loader, device, cfg):
         gt_point    = batch['grasp_point_idx'].to(device)
         gt_rotation = batch['grasp_rotation'].to(device)
         gt_width    = batch['grasp_width'].to(device)
+        gt_depth    = batch['grasp_depth'].to(device)
         mask_valid  = batch['mask_valid'].to(device)
 
         gt_masks_flat    = masks.flatten(0, 1).bool()
@@ -184,6 +191,7 @@ def validate(model, criterion, loader, device, cfg):
                 gt_rotation  = gt_rotation,
                 gt_width     = gt_width,
                 valid        = mask_valid_flat,
+                gt_depth     = gt_depth,
             )
 
         total_loss += loss_dict['loss'].item()

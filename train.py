@@ -1,7 +1,6 @@
 # train.py
 """
 Training script for GraspPointSAM.
-Follows GraspSAM's simple training style.
 
 Usage:
     python prepare_grasp_labels.py --config configs/graspnet.yaml   # once
@@ -23,37 +22,26 @@ from grasp_point_sam.data.graspnet_dataset import GraspNetDataset, scene_range
 from grasp_point_sam.losses.grasp_loss import GraspPointSAMLoss
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Arguments
-# ─────────────────────────────────────────────────────────────────────────────
-
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config',     type=str, default='configs/graspnet.yaml')
-    parser.add_argument('--resume',     type=str, default=None)
-    parser.add_argument('--save',       type=bool, default=True)
-    # end this run before max_epochs (exclusive); the LR schedule still spans
-    # max_epochs, so training can be continued later with --resume
+    parser.add_argument('--config', type=str, default='configs/graspnet.yaml')
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--save', type=bool, default=True)
     parser.add_argument('--stop_epoch', type=int, default=None)
     return parser.parse_args()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Collate function — pads variable M across batch
-# ─────────────────────────────────────────────────────────────────────────────
 
 def collate_fn(batch):
     max_M = max(s['masks'].shape[0] for s in batch)
 
-    coords_list    = []
-    features_list  = []
-    masks_list     = []
-    quality_list   = []
+    coords_list = []
+    features_list = []
+    masks_list = []
+    quality_list = []
     point_idx_list = []
-    rotation_list  = []
-    width_list     = []
-    depth_list     = []
-    valid_list     = []
+    rotation_list = []
+    width_list = []
+    depth_list = []
+    valid_list = []
 
     for b, s in enumerate(batch):
         M, N = s['masks'].shape
@@ -82,55 +70,50 @@ def collate_fn(batch):
         valid_list.append(torch.arange(max_M) < M)
 
     return {
-        'coords':          torch.stack(coords_list),
-        'features':        torch.stack(features_list),
-        'masks':           torch.stack(masks_list),
-        'grasp_quality':   torch.stack(quality_list),
+        'coords': torch.stack(coords_list),
+        'features': torch.stack(features_list),
+        'masks': torch.stack(masks_list),
+        'grasp_quality': torch.stack(quality_list),
         'grasp_point_idx': torch.cat(point_idx_list),
-        'grasp_rotation':  torch.cat(rotation_list),
-        'grasp_width':     torch.cat(width_list),
-        'grasp_depth':     torch.cat(depth_list),
-        'mask_valid':      torch.stack(valid_list),
+        'grasp_rotation': torch.cat(rotation_list),
+        'grasp_width': torch.cat(width_list),
+        'grasp_depth': torch.cat(depth_list),
+        'mask_valid': torch.stack(valid_list),
     }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Train one epoch
-# ─────────────────────────────────────────────────────────────────────────────
 
 def train_one_epoch(model, criterion, loader, optimizer, scaler, device, epoch, cfg):
     model.train()
     total_loss = 0.0
 
     for step, batch in enumerate(loader):
-        coords      = batch['coords'].to(device)
-        features    = batch['features'].to(device)
-        masks       = batch['masks'].to(device)
-        gt_quality  = batch['grasp_quality'].to(device)
-        gt_point    = batch['grasp_point_idx'].to(device)
+        coords = batch['coords'].to(device)
+        features = batch['features'].to(device)
+        masks = batch['masks'].to(device)
+        gt_quality = batch['grasp_quality'].to(device)
+        gt_point = batch['grasp_point_idx'].to(device)
         gt_rotation = batch['grasp_rotation'].to(device)
-        gt_width    = batch['grasp_width'].to(device)
-        gt_depth    = batch['grasp_depth'].to(device)
-        mask_valid  = batch['mask_valid'].to(device)
+        gt_width = batch['grasp_width'].to(device)
+        gt_depth = batch['grasp_depth'].to(device)
+        mask_valid = batch['mask_valid'].to(device)
 
         # Flatten B*M
-        gt_masks_flat    = masks.flatten(0, 1).bool()
-        gt_quality_flat  = gt_quality.flatten(0, 1)
-        mask_valid_flat  = mask_valid.flatten(0, 1)
+        gt_masks_flat = masks.flatten(0, 1).bool()
+        gt_quality_flat = gt_quality.flatten(0, 1)
+        mask_valid_flat = mask_valid.flatten(0, 1)
 
         optimizer.zero_grad()
 
         with torch.cuda.amp.autocast(enabled=(cfg.training.mixed_precision == 'fp16')):
-            outputs   = model(coords=coords, features=features, gt_masks=masks)
+            outputs = model(coords=coords, features=features, gt_masks=masks)
             loss_dict = criterion(
-                outputs      = outputs,
-                gt_masks     = gt_masks_flat,
-                gt_quality   = gt_quality_flat,
+                outputs = outputs,
+                gt_masks = gt_masks_flat,
+                gt_quality = gt_quality_flat,
                 grasp_point_idx = gt_point,
-                gt_rotation  = gt_rotation,
-                gt_width     = gt_width,
-                valid        = mask_valid_flat,
-                gt_depth     = gt_depth,
+                gt_rotation = gt_rotation,
+                gt_width = gt_width,
+                valid = mask_valid_flat,
+                gt_depth = gt_depth,
             )
 
         loss = loss_dict['loss']
@@ -156,30 +139,26 @@ def train_one_epoch(model, criterion, loader, optimizer, scaler, device, epoch, 
 
     return total_loss / len(loader)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Validate
-# ─────────────────────────────────────────────────────────────────────────────
-
 @torch.no_grad()
 def validate(model, criterion, loader, device, cfg):
     model.eval()
     total_loss = 0.0
 
     for batch in loader:
-        coords      = batch['coords'].to(device)
-        features    = batch['features'].to(device)
-        masks       = batch['masks'].to(device)
-        gt_quality  = batch['grasp_quality'].to(device)
-        gt_point    = batch['grasp_point_idx'].to(device)
+        coords = batch['coords'].to(device)
+        features = batch['features'].to(device)
+        masks = batch['masks'].to(device)
+        gt_quality = batch['grasp_quality'].to(device)
+        gt_point = batch['grasp_point_idx'].to(device)
         gt_rotation = batch['grasp_rotation'].to(device)
-        gt_width    = batch['grasp_width'].to(device)
-        gt_depth    = batch['grasp_depth'].to(device)
-        mask_valid  = batch['mask_valid'].to(device)
+        gt_width = batch['grasp_width'].to(device)
+        gt_depth = batch['grasp_depth'].to(device)
+        mask_valid = batch['mask_valid'].to(device)
 
-        gt_masks_flat    = masks.flatten(0, 1).bool()
-        gt_quality_flat  = gt_quality.flatten(0, 1)
-        mask_valid_flat  = mask_valid.flatten(0, 1)
+        gt_masks_flat = masks.flatten(0, 1).bool()
+        gt_quality_flat = gt_quality.flatten(0, 1)
+        mask_valid_flat = mask_valid.flatten(0, 1)
 
         with torch.cuda.amp.autocast(enabled=(cfg.training.mixed_precision == 'fp16')):
             outputs   = model(coords=coords, features=features, gt_masks=masks)
@@ -199,10 +178,6 @@ def validate(model, criterion, loader, device, cfg):
     return total_loss / len(loader)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
     args = parse_args()
     cfg  = OmegaConf.load(args.config)
@@ -216,39 +191,21 @@ def main():
         output_dir = Path(args.resume).parent
     else:
         output_dir = Path(cfg.training.output_dir) / datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints: {output_dir}")
 
-    # Model
-    print("Building model...")
     model = build_model(cfg).to(device)
 
-    # Loss
-    criterion = GraspPointSAMLoss(
-        grasp_scale      = 2.0,
-        mask_scale       = 1.0,
-        joint_mask_grasp = cfg.model.joint_mask_grasp,
-    ).to(device)
+    criterion = GraspPointSAMLoss(grasp_scale = 2.0, mask_scale = 1.0, joint_mask_grasp = cfg.model.joint_mask_grasp).to(device)
 
-    # Optimizer — only trainable params (grasp_decoder)
-    params    = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        params,
-        lr           = cfg.training.learning_rate,
-        weight_decay = cfg.training.weight_decay,
-    )
-
-    # Scheduler — same as GraspSAM
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max   = cfg.training.max_epochs,
-        eta_min = 1e-7,
-    )
+    # Optimizer - only trainable params (grasp_decoder)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr = cfg.training.learning_rate, weight_decay = cfg.training.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = cfg.training.max_epochs, eta_min = 1e-7)
 
     # Mixed precision scaler
-    scaler = torch.cuda.amp.GradScaler(
-        enabled=(cfg.training.mixed_precision == 'fp16')
-    )
+    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.training.mixed_precision == 'fp16'))
 
     # Resume
     start_epoch   = 0
@@ -259,53 +216,52 @@ def main():
         model.load_state_dict(ckpt['model'], strict=False)
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
-        start_epoch   = ckpt['epoch'] + 1
+        start_epoch = ckpt['epoch'] + 1
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
         print(f"Resumed from epoch {start_epoch}")
 
-    # Datasets
     print("Loading datasets...")
     dataset_args = dict(
-        graspnet_root    = cfg.data.graspnet_root,
-        label_dir        = cfg.data.label_dir,
-        cameras          = cfg.data.cameras,
-        num_points       = cfg.training.num_points,
+        graspnet_root = cfg.data.graspnet_root,
+        label_dir = cfg.data.label_dir,
+        cameras = cfg.data.cameras,
+        num_points = cfg.training.num_points,
         frames_per_scene = cfg.data.frames_per_scene,
         fric_coef_thresh = cfg.data.fric_coef_thresh,
-        grasp_radius     = cfg.data.grasp_radius,
-        sampling         = cfg.data.get('sampling', 'random'),
-        workspace_crop   = cfg.data.get('workspace_crop', False),
-        voxel_size       = cfg.data.get('voxel_size', 0.005),
+        grasp_radius = cfg.data.grasp_radius,
+        sampling = cfg.data.get('sampling', 'random'),
+        workspace_crop = cfg.data.get('workspace_crop', False),
+        voxel_size = cfg.data.get('voxel_size', 0.005),
     )
     train_dataset = GraspNetDataset(
         scene_ids = scene_range(cfg.data.train_scenes),
-        split     = 'train',
-        augment   = True,
+        split = 'train',
+        augment = True,
         **dataset_args,
     )
     val_dataset = GraspNetDataset(
         scene_ids = scene_range(cfg.data.val_scenes),
-        split     = 'val',
-        augment   = False,
+        split = 'val',
+        augment = False,
         **dataset_args,
     )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size  = cfg.training.batch_size,
-        shuffle     = True,
+        batch_size = cfg.training.batch_size,
+        shuffle = True,
         num_workers = cfg.data.num_workers,
-        collate_fn  = collate_fn,
-        pin_memory  = cfg.data.pin_memory,
-        drop_last   = True,
+        collate_fn = collate_fn,
+        pin_memory = cfg.data.pin_memory,
+        drop_last = True,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size  = cfg.training.batch_size,
-        shuffle     = False,
+        batch_size = cfg.training.batch_size,
+        shuffle = False,
         num_workers = cfg.data.num_workers,
-        collate_fn  = collate_fn,
-        pin_memory  = cfg.data.pin_memory,
+        collate_fn = collate_fn,
+        pin_memory = cfg.data.pin_memory,
     )
 
     end_epoch = cfg.training.max_epochs
@@ -321,10 +277,8 @@ def main():
         print(f"\nEpoch {epoch}/{cfg.training.max_epochs} | LR: {scheduler.get_last_lr()[0]:.2e}")
         print("-" * 60)
 
-        train_loss = train_one_epoch(
-            model, criterion, train_loader,
-            optimizer, scaler, device, epoch, cfg
-        )
+        train_loss = train_one_epoch(model, criterion, train_loader, optimizer, scaler, device, epoch, cfg)
+        
         scheduler.step()
         print(f"Train Loss: {train_loss:.4f}")
 
@@ -346,23 +300,22 @@ def main():
         if args.save and (epoch % cfg.training.save_freq == 0 or is_best or is_last):
             ckpt_path = output_dir / f'checkpoint_epoch_{epoch:04d}.pth'
             torch.save({
-                'epoch':         epoch,
-                'model':         model.state_dict(),
-                'optimizer':     optimizer.state_dict(),
-                'scheduler':     scheduler.state_dict(),
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
                 'best_val_loss': best_val_loss,
             }, ckpt_path)
             print(f"Saved: {ckpt_path}")
 
             if is_best:
                 torch.save({
-                    'epoch':         epoch,
-                    'model':         model.state_dict(),
-                    'optimizer':     optimizer.state_dict(),
-                    'scheduler':     scheduler.state_dict(),
+                    'epoch': epoch,
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
                     'best_val_loss': best_val_loss,
                 }, output_dir / 'best_model.pth')
-                # weights only, for inference / sharing (no pickle)
                 save_model(model, str(output_dir / 'best_model.safetensors'))
                 print(f"Saved best model.")
 

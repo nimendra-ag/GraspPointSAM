@@ -17,7 +17,7 @@ from .grasp_point_sam import GraspPointSAM
 
 def build_model(cfg: DictConfig) -> GraspPointSAM:
     """
-    Build GraspPointSAM from hydra config.
+    Build GraspPointSAM
 
     Args:
         cfg: the full config (contents of configs/graspnet.yaml)
@@ -27,9 +27,8 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         if cfg.model.freeze_encoder is True.
     """
 
-    m = cfg.model  # shorthand
+    m = cfg.model
 
-    # PatchEmbed 
     patch_embed = PatchEmbed(
         in_channels = m.patch_embed.in_channels,
         out_channels = m.patch_embed.out_channels,
@@ -43,17 +42,14 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         pretrained=m.transformer.pretrained,
     )
 
-    # PointCloudEncoder
     pc_encoder = PointCloudEncoder(
         patch_embed = patch_embed,
         transformer = transformer_backbone,
         embed_dim = m.pc_encoder.embed_dim,
     )
 
-    # PointEncoder 
     point_encoder = PointEncoder(embed_dim=m.point_encoder.embed_dim)
 
-    # MaskEncoder
     mask_encoder = MaskEncoder(embed_dim=m.mask_encoder.embed_dim)
 
     # MaskDecoder (PointSAM original)
@@ -67,19 +63,14 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         ),
     )
 
-    # GraspDecoder3D
+    # GraspDecoder3D: reuses mask_decoder's transformer, iou/mask tokens and
+    # mask heads (as GraspSAM does with SAM's decoder)
     grasp_decoder = GraspDecoder3D(
-        transformer = TwoWayTransformer(
-            depth = m.grasp_decoder.depth,
-            embedding_dim = m.grasp_decoder.transformer_dim,
-            num_heads = m.grasp_decoder.num_heads,
-            mlp_dim = m.grasp_decoder.mlp_dim,
-        ),
+        mask_decoder = mask_decoder,
         transformer_dim = m.grasp_decoder.transformer_dim,
         joint_mask_grasp = m.grasp_decoder.joint_mask_grasp,
         num_grasp_rot_tokens = m.grasp_decoder.num_grasp_rot_tokens,
-        # 0 for configs / checkpoints from before the depth head
-        num_depth_bins = m.grasp_decoder.get('num_depth_bins', 0),
+        num_depth_bins = 4,
     )
 
     # Assemble GraspPointSAM 
@@ -91,10 +82,16 @@ def build_model(cfg: DictConfig) -> GraspPointSAM:
         grasp_decoder = grasp_decoder,
         prompt_iters = m.prompt_iters,
         joint_mask_grasp = m.joint_mask_grasp,
+        # masks encoded together in iterations 2+ (speed only, same result)
+        mask_encoder_chunk = m.mask_encoder_chunk,
     )
 
     # Load pretrained PointSAM weights 
     model.load_pretrained_pointsam(m.pretrained_ckpt)
+
+    # Start the grasp point features from PointSAM's upscaling weights
+    # (after loading, so the pretrained weights are copied, not random ones)
+    grasp_decoder.point_upscale.load_state_dict(mask_decoder.output_upscaling.state_dict())
 
     # Freeze encoder if specified 
     if m.freeze_encoder:

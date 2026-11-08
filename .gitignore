@@ -9,3 +9,4 @@ data-rgbdmatter/
 **.npy
 **.safetensors
 eval_results/
+model-graspsam/

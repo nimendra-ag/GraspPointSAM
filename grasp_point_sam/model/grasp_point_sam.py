@@ -1,4 +1,3 @@
-# grasp_point_sam/model/grasp_point_sam.py
 """
 GraspPointSAM - Top-level model.
 
@@ -42,6 +41,7 @@ class GraspPointSAM(nn.Module):
         grasp_decoder : GraspDecoder3D (new, randomly initialized)
         prompt_iters : number of iterative prompt refinement steps
         joint_mask_grasp : if True, predict masks alongside grasps
+        mask_encoder_chunk: number of masks run at a time
     """
 
     def __init__(
@@ -53,6 +53,7 @@ class GraspPointSAM(nn.Module):
         grasp_decoder: GraspDecoder3D,
         prompt_iters: int  = 3,
         joint_mask_grasp: bool = True,
+        mask_encoder_chunk: int = 1,
     ):
         super().__init__()
 
@@ -63,6 +64,7 @@ class GraspPointSAM(nn.Module):
         self.grasp_decoder = grasp_decoder
         self.prompt_iters = prompt_iters
         self.joint_mask_grasp = joint_mask_grasp
+        self.mask_encoder_chunk = mask_encoder_chunk
 
     # Pretrained weight loading
     def load_pretrained_pointsam(self, ckpt_path: str) -> None:
@@ -83,6 +85,13 @@ class GraspPointSAM(nn.Module):
         state_dict = load_file(ckpt_path)
 
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
+
+        # Modules the grasp decoder shares with mask_decoder
+        # appear as missing under their grasp_decoder.* name but were filled
+        # through their mask_decoder.* name, so they are not missing.
+        own = self.state_dict(keep_vars=True)
+        loaded = {own[k].data_ptr() for k in state_dict if k in own}
+        missing = [k for k in missing if own[k].data_ptr() not in loaded]
 
         # Only grasp_decoder keys should be missing
         non_grasp_missing = [
@@ -134,11 +143,12 @@ class GraspPointSAM(nn.Module):
         fps_idx: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """
-        Run mask_encoder one mask at a time to bound peak GPU memory.
-        Its [*, L, K, 512] activations are ~0.5 GB per mask with
-        1024 patches x 256 neighbors, so encoding all B*M masks at once
-        does not fit on small GPUs. Each mask is encoded independently,
-        so the result is identical.
+        Run mask_encoder on mask_encoder_chunk masks at a time to bound
+        peak GPU memory. Its [*, L, K, 512] activations are ~0.5 GB per
+        mask with 1024 patches x 256 neighbors, so encoding all B*M masks
+        at once does not fit on small GPUs (chunk 1 for a 6 GB GPU, ~8 for
+        an A100 40 GB). Each mask is encoded independently with its own
+        scene's points, so the result is the same for any chunk size.
 
         Args:
             prompt_masks : [B*M, N] or None
@@ -155,16 +165,22 @@ class GraspPointSAM(nn.Module):
                 None, coords, centers, knn_idx, center_idx=fps_idx,
             )
 
-        M = prompt_masks.shape[0] // coords.shape[0]
+        num_rows = prompt_masks.shape[0]
+        M        = num_rows // coords.shape[0]
+        scene    = torch.arange(num_rows, device=coords.device) // M  # scene of each mask
+        chunk    = self.mask_encoder_chunk
+
         dense_embeddings = []
-        for r in range(prompt_masks.shape[0]):
-            b = r // M  # scene index of this mask
+        for start in range(0, num_rows, chunk):
+            # each mask gets its own copy of its scene's points, so a chunk
+            # can mix masks from different scenes
+            b = scene[start:start + chunk]
             dense_embeddings.append(self.mask_encoder(
-                prompt_masks[r:r + 1],
-                coords[b:b + 1],
-                centers[b:b + 1],
-                knn_idx[b:b + 1],
-                center_idx=None if fps_idx is None else fps_idx[b:b + 1],
+                prompt_masks[start:start + chunk],
+                coords[b],
+                centers[b],
+                knn_idx[b],
+                center_idx=None if fps_idx is None else fps_idx[b],
             ))
         return torch.cat(dense_embeddings, dim=0)
 

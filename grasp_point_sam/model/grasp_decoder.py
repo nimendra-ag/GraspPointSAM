@@ -160,12 +160,9 @@ class GraspDecoder3D(nn.Module):
         transformer_dim: int = 256,
         joint_mask_grasp: bool = True,
         num_grasp_rot_tokens: int = 6,
-        num_depth_bins: int = 0,
+        num_depth_bins: int = 4,
     ):
         super().__init__()
-        if num_depth_bins not in (0, len(GRASP_DEPTHS)):
-            raise ValueError(
-                f"num_depth_bins must be 0 or {len(GRASP_DEPTHS)}, got {num_depth_bins}")
 
         self.transformer = transformer
         self.transformer_dim = transformer_dim
@@ -173,15 +170,14 @@ class GraspDecoder3D(nn.Module):
         self.num_grasp_rot_tokens = num_grasp_rot_tokens
         self.num_depth_bins = num_depth_bins
 
-        # Mask tokens (from original SAM, kept for joint mode)
         # iou_token: 1 token that predicts mask IoU quality
         self.iou_token = nn.Embedding(1, transformer_dim)
+
         # mask_tokens: 4 tokens, one per mask output
         # (SAM uses 4: 1 single-mask + 3 multi-mask)
         self.mask_tokens = nn.Embedding(self.NUM_MASK_TOKENS, transformer_dim)
 
-        # Grasp tokens (new, learned from scratch)
-        # 1 token -> predicts per-point grasp quality score
+        # 1 token - predicts per-point grasp quality score
         self.grasp_quality_token = nn.Embedding(1, transformer_dim)
 
         # 6 tokens -> predict 6D rotation (one token per output dimension)
@@ -193,8 +189,7 @@ class GraspDecoder3D(nn.Module):
 
         # num_depth_bins tokens -> per-point logit of each gripper depth
         # (one token per depth, same pattern as the rotation tokens)
-        if num_depth_bins > 0:
-            self.grasp_depth_tokens = nn.Embedding(num_depth_bins, transformer_dim)
+        self.grasp_depth_tokens = nn.Embedding(num_depth_bins, transformer_dim)
 
         # MLP heads (hypernetwork pattern) 
         # Each MLP takes a token embedding [D] -> weight vector
@@ -229,16 +224,15 @@ class GraspDecoder3D(nn.Module):
         )
 
         # Depth heads: one MLP per depth token, 1 logit per point each
-        if num_depth_bins > 0:
-            self.depth_heads = nn.ModuleList([
-                GraspMLP(
-                    input_dim=transformer_dim,
-                    hidden_dim=transformer_dim,
-                    output_dim=transformer_dim,
-                    num_layers=3,
-                )
-                for _ in range(num_depth_bins)
-            ])
+        self.depth_heads = nn.ModuleList([
+            GraspMLP(
+                input_dim=transformer_dim,
+                hidden_dim=transformer_dim,
+                output_dim=transformer_dim,
+                num_layers=3,
+            )
+            for _ in range(num_depth_bins)
+        ])
 
         # Mask output MLP heads (joint mode only) 
         # Same pattern as original SAM mask decoder
@@ -280,8 +274,6 @@ class GraspDecoder3D(nn.Module):
         multimask_output: bool = True,
     ) -> GraspPredictions:
         """
-        Forward pass.
-
         The key shape to track throughout:
             B  = batch size
             M  = number of prompted instances per scene
@@ -291,25 +283,24 @@ class GraspDecoder3D(nn.Module):
             K  = number of sparse prompt tokens
         """
 
-        #  Step 1: Build token sequence 
-        # Concatenate all learnable tokens into one sequence.
+        # Step 1: Concatenate all learnable tokens into one sequence.
         # Order: [iou | mask_0..3 | quality | rot_0..5 | width]
         # Shape: [1, num_tokens, D]
         
         if self.joint_mask_grasp:
             output_tokens = torch.cat([
-                self.iou_token.weight,            # [1, D]
-                self.mask_tokens.weight,           # [4, D]
-                self.grasp_quality_token.weight,   # [1, D]
-                self.grasp_rotation_tokens.weight, # [6, D]
-                self.grasp_width_token.weight,     # [1, D]
+                self.iou_token.weight,            
+                self.mask_tokens.weight,           
+                self.grasp_quality_token.weight,
+                self.grasp_rotation_tokens.weight, 
+                self.grasp_width_token.weight,     
             ], dim=0)  # [13, D]
         else:
             # Grasp-only: no iou/mask tokens
             output_tokens = torch.cat([
-                self.grasp_quality_token.weight,   # [1, D]
-                self.grasp_rotation_tokens.weight, # [6, D]
-                self.grasp_width_token.weight,     # [1, D]
+                self.grasp_quality_token.weight,   
+                self.grasp_rotation_tokens.weight,
+                self.grasp_width_token.weight,
             ], dim=0)  # [8, D]
 
         # Depth tokens go last, so the indices of the tokens above stay the same

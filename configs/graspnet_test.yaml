@@ -40,6 +40,7 @@ model:
     joint_mask_grasp: true
 
   prompt_iters: 5
+  mask_encoder_chunk: 1        # masks per mask-encoder call (6 GB laptop GPU); speed only, same result
 
 training:
   batch_size: 1

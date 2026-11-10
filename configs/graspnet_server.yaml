@@ -1,0 +1,83 @@
+# Training on the lab server (RTX 4070 Ti SUPER 16 GB, 24 CPUs, 31 GB RAM).
+# python train.py --config configs/graspnet_server.yaml
+model:
+  pretrained_ckpt: "pretrained/pointsam/model.safetensors"
+  freeze_encoder: true
+  joint_mask_grasp: true
+
+  patch_embed:              # must be indented under model
+    in_channels: 6
+    out_channels: 512  # compatible with unit3d-l
+    num_patches: 1024
+    patch_size: 256
+
+  transformer:
+    model_name: "eva02_large_patch14_448"
+    pretrained: false
+
+  pc_encoder:
+    embed_dim: 256
+
+  point_encoder:
+    embed_dim: 256 
+
+  mask_encoder:
+    embed_dim: 256
+
+  mask_decoder:
+    transformer_dim: 256
+    depth: 2
+    num_heads: 8
+    mlp_dim: 2048
+
+  grasp_decoder:
+    transformer_dim: 256
+    depth: 2
+    num_heads: 8
+    mlp_dim: 2048
+    num_grasp_rot_tokens: 6
+    num_depth_bins: 4           # gripper depth classes 0.01-0.04 m (0 = no depth head)
+    joint_mask_grasp: true
+
+  prompt_iters: 5
+  mask_encoder_chunk: 2        # 4 ran out of memory on 16 GB with batch 2; speed only, same result
+
+training:
+  batch_size: 2                # 16 GB GPU; set 1 if out of GPU memory
+  num_points: 10000
+  learning_rate: 3.0e-4        # confirmed from official large.yaml
+  weight_decay: 0.1            # confirmed from official large.yaml
+  max_epochs: 20               # final length; LR decays fully by epoch 20
+  max_grad_value: 1.0          # confirmed from official large.yaml
+  gradient_accumulation_steps: 1
+  mixed_precision: "fp16"      # essential for memory efficiency
+  gradient_checkpointing: true
+  output_dir: "checkpoints"
+  log_every_n_steps: 10
+  val_every_n_epochs: 10       # validate after epochs 10 and 20
+  save_freq: 5                 # checkpoint after epochs 5, 10, 15, 20
+
+  scheduler:
+    milestones: [400000, 500000]  # confirmed from official large.yaml
+    warmup_iters: 3000
+    warmup_factor: 0.001
+    gamma: 0.1
+
+data:
+  graspnet_root: "/home/cse_g4/graspnet"   # scenes/scene_0000 ... scene_0099
+  label_dir: "data/graspnet_scene_labels"
+  cameras: ["realsense", "kinect"]
+  train_scenes: [0, 90]                  # scene ids [start, end); GraspNet train split is 0-99
+  val_scenes: [90, 100]                  # held out from the train split
+  frames_per_scene: 256                  # per camera, evenly spaced over the 256 frames
+  fric_coef_thresh: 0.1                  # as RGBD-Matter; lower = stricter (graspnetAPI default 0.4)
+  grasp_radius: 0.02                     # m, point -> nearest labelled grasp point
+  sampling: "fps"                        # "random" or "fps" (voxel downsample + farthest point sampling)
+  workspace_crop: true                   # crop to objects' bounding box + 2 cm (graspnet-baseline)
+  voxel_size: 0.005                      # m, for sampling: "fps"
+  num_workers: 12                        # server has 24 CPUs, 31 GB RAM
+  pin_memory: true
+
+eval:
+  top_k_grasps: 50
+  iou_threshold: 0.25

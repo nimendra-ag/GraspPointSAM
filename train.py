@@ -8,8 +8,20 @@ Usage:
 """
 
 import argparse
+import logging
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+# Quiet expected messages (set before the imports below; DataLoader workers
+# inherit these filters):
+# - graspnetAPI's autolab_core logs ROS warnings at import (ROS is not used)
+# - per-frame dataset notes such as "object N dropped, <= 10 points" or
+#   "object N has no grasp passing the friction threshold" (normal occlusion
+#   and label cases, handled in the dataset)
+logging.getLogger().setLevel(logging.ERROR)
+warnings.filterwarnings('ignore', category=UserWarning,
+                        module=r'grasp_point_sam\.data\.graspnet_dataset')
 
 import torch
 import torch.nn as nn
@@ -282,9 +294,13 @@ def main():
         scheduler.step()
         print(f"Train Loss: {train_loss:.4f}")
 
+        # epochs completed so far (epoch is 0-based): with an interval of 5,
+        # validate and save after epochs 5, 10, 15, ...
+        done = epoch + 1
+
         # Validate (also on the last epoch of this run, to judge whether to resume)
         is_last = epoch == end_epoch - 1
-        if epoch % cfg.training.val_every_n_epochs == 0 or is_last:
+        if done % cfg.training.val_every_n_epochs == 0 or is_last:
             val_loss = validate(model, criterion, val_loader, device, cfg)
             print(f"Val Loss:   {val_loss:.4f}")
 
@@ -297,8 +313,9 @@ def main():
 
         # Save
         # always save the last epoch of this run so it can be resumed
-        if args.save and (epoch % cfg.training.save_freq == 0 or is_best or is_last):
-            ckpt_path = output_dir / f'checkpoint_epoch_{epoch:04d}.pth'
+        if args.save and (done % cfg.training.save_freq == 0 or is_best or is_last):
+            # named by epochs completed: checkpoint_epoch_0025.pth = after 25 epochs
+            ckpt_path = output_dir / f'checkpoint_epoch_{done:04d}.pth'
             torch.save({
                 'epoch': epoch,
                 'model': model.state_dict(),

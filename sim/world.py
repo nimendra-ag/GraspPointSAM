@@ -23,26 +23,25 @@ from .assets import prepare_object
 
 DT = 1.0 / 240.0
 
-# ── camera: GraspNet-1Billion RealSense D435 intrinsics ─────────────────────
+# camera: GraspNet-1Billion RealSense D435 intrinsics 
 CAM_W, CAM_H = 1280, 720
 CAM_K = np.array([[927.17, 0.0, 651.32],
                   [0.0, 927.37, 349.62],
                   [0.0, 0.0, 1.0]])
-CAM_EYE    = (1.00, 0.0, 0.60)        # opposite the arm, looking down at the workspace
+CAM_EYE = (1.00, 0.0, 0.60)        # opposite the arm, looking down at the workspace
 CAM_TARGET = (0.50, 0.0, 0.00)
 
-# ── workspace ───────────────────────────────────────────────────────────────
+#  workspace 
 WORKSPACE = ((0.35, 0.65), (-0.20, 0.20))   # x, y range where objects are dropped (m)
 DROP_POS  = (0.30, 0.55, 0.30)              # where grasped objects are released
 
-# ── Franka Panda (pybullet_data/franka_panda/panda.urdf) ────────────────────
-PANDA_URDF = 'franka_panda/panda.urdf'
+#  Franka Panda (pybullet_data/franka_panda/panda.urdf) 
 ARM_JOINTS = list(range(7))                  # panda_joint1..7
-FINGERS    = (9, 10)                         # panda_finger_joint1/2, q = half opening
+FINGERS = (9, 10)                         # panda_finger_joint1/2, q = half opening
 EE_LINK    = 11                              # panda_grasptarget, 0.105 m from the hand
 ARM_FORCES = [87.0] * 4 + [12.0] * 3         # URDF effort limits (Nm)
-HOME       = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]   # Franka "ready" pose
-OBSERVE    = [1.4, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]   # ready pose turned aside (out of view)
+HOME = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]   # Franka "ready" pose
+OBSERVE = [1.4, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]   # ready pose turned aside (out of view)
 MAX_WIDTH  = 0.08                            # Franka Hand max opening (m)
 # fingertips are 0.0584 (finger joint) + 0.0538 (finger) = 0.1122 m from the hand
 FINGERTIP_FROM_EE = 0.1122 - 0.105
@@ -51,10 +50,10 @@ FINGERTIP_FROM_EE = 0.1122 - 0.105
 GRASP_TO_HAND = np.array([[0.0, 0.0, 1.0],
                           [0.0, 1.0, 0.0],
                           [-1.0, 0.0, 0.0]])
-TOP_DOWN   = Rotation.from_euler('x', np.pi).as_quat()   # hand pointing down
+TOP_DOWN = Rotation.from_euler('x', np.pi).as_quat()   # hand pointing down
 IK_POS_TOL = 0.005                            # m
 IK_ANG_TOL = np.deg2rad(3.0)
-APPROACH   = 0.10                             # pre-grasp distance (m)
+APPROACH = 0.10                             # pre-grasp distance (m)
 
 
 def look_at(eye, target, up=(0.0, 0.0, 1.0)) -> np.ndarray:
@@ -117,7 +116,7 @@ class TabletopWorld:
         )
         p.changeDynamics(self.table, -1, lateralFriction=friction)
 
-        self.robot = p.loadURDF(PANDA_URDF, [0, 0, 0], useFixedBase=True,
+        self.robot = p.loadURDF("franka_panda/panda.urdf", [0, 0, 0], useFixedBase=True,
                                 flags=p.URDF_USE_INERTIA_FROM_FILE)
         for link in (-1, 0):                      # base stands on the table
             p.setCollisionFilterPair(self.robot, self.table, link, -1, 0)
@@ -143,7 +142,7 @@ class TabletopWorld:
             if self.gui:
                 time.sleep(DT)
 
-    # ── objects ─────────────────────────────────────────────────────────────
+    #  objects 
 
     def spawn_objects(self, obj_ids, graspnet_root, cache_dir, rng,
                       min_dist: float = 0.10) -> None:
@@ -188,7 +187,7 @@ class TabletopWorld:
     def height(self, obj_id: int) -> float:
         return p.getBasePositionAndOrientation(self.objects[obj_id])[0][2]
 
-    # ── camera ──────────────────────────────────────────────────────────────
+    #  camera 
 
     def capture(self, near: float = 0.05, far: float = 3.0):
         """
@@ -202,18 +201,18 @@ class TabletopWorld:
             renderer=p.ER_TINY_RENDERER, lightDirection=light, shadow=0,
             lightAmbientCoeff=0.6, lightDiffuseCoeff=0.5, lightSpecularCoeff=0.05,
         )
-        rgb  = np.reshape(rgba, (CAM_H, CAM_W, 4))[..., :3].astype(np.uint8)
+        rgb = np.reshape(rgba, (CAM_H, CAM_W, 4))[..., :3].astype(np.uint8)
         dbuf = np.reshape(dbuf, (CAM_H, CAM_W))
-        z    = far * near / (far - (far - near) * dbuf)
+        z = far * near / (far - (far - near) * dbuf)
         z[dbuf >= 1.0] = 0.0
 
-        seg  = np.reshape(seg, (CAM_H, CAM_W))
-        lab  = np.zeros((CAM_H, CAM_W), dtype=np.int32)
+        seg = np.reshape(seg, (CAM_H, CAM_W))
+        lab = np.zeros((CAM_H, CAM_W), dtype=np.int32)
         for obj_id, body in self.objects.items():
             lab[seg == body] = obj_id + 1
         return rgb, z, lab
 
-    # ── arm ─────────────────────────────────────────────────────────────────
+    #  arm 
 
     def _joint_state(self) -> list:
         return [p.getJointState(self.robot, j)[0] for j in ARM_JOINTS + list(FINGERS)]
@@ -280,7 +279,7 @@ class TabletopWorld:
             self._arm_targets(self._ik_solve(start + t * (goal - start), orn))
             self.step(steps_each)
 
-    # ── grasping ────────────────────────────────────────────────────────────
+    #  grasping 
 
     def plan_grasp(self, grasp: np.ndarray, collision_tol: float = 0.005):
         """

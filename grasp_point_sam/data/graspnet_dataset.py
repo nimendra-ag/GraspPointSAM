@@ -14,8 +14,8 @@ Per sample:
     - point cloud back-projected from depth, random subsample to num_points
     - per-point RGB colors
     - per-object masks from the segmentation image
-    - per-object, per-point grasp quality (1.1 - lowest friction of the
-      point's grasps; 0 = no grasp)
+    - per-object, per-point grasp quality in [0, 1]: how many valid grasps
+      the point has (log-scaled, see quality_from_counts; 0 = no grasp)
     - every grasp of every labelled point as a flat list
       (grasp_point_idx, grasp_rotation, grasp_width, grasp_depth),
       see _assign_grasps
@@ -45,6 +45,14 @@ from graspnetAPI.utils.xmlhandler import xmlReader
 NUM_VIEWS = 300  # as in GraspNet.loadGrasp
 
 WORKSPACE_MARGIN = 0.02  # m, as graspnet-baseline's get_workspace_mask(outlier=0.02)
+
+# Grasp quality target = how many valid grasps (collision-free, friction <=
+# threshold) a point has, log-scaled to [0, 1]; similar in spirit to GSNet's
+# graspness. With friction <= 0.1 every kept grasp has friction exactly 0.1,
+# so the old target 1.1 - friction was 1.0 for every labelled point and gave
+# the model nothing to rank. Counts per labelled point (scenes 0-99): median 4,
+# 90th percentile 14, 99th percentile 25, max 37.
+QUALITY_REF_COUNT = 25  # count that maps to quality 1.0 (larger counts are clipped)
 
 LABEL_FILES = [
     'points', 'point_obj_ids', 'point_offsets',
@@ -144,6 +152,16 @@ def rotation_matrix_to_6d(R: np.ndarray) -> np.ndarray:
         [..., 6]
     """
     return np.concatenate([R[..., :, 0], R[..., :, 1]], axis=-1)
+
+
+def quality_from_counts(counts: np.ndarray) -> np.ndarray:
+    """
+    Number of valid grasps per point -> quality in [0, 1].
+    log(1 + n) / log(1 + QUALITY_REF_COUNT), clipped at 1:
+    1 grasp -> 0.21, 4 -> 0.49, 8 -> 0.67, 14 -> 0.83, >= 25 -> 1.0.
+    """
+    q = np.log1p(counts) / np.log1p(QUALITY_REF_COUNT)
+    return np.clip(q, 0.0, 1.0).astype(np.float32)
 
 
 def nearest_neighbor(
@@ -551,8 +569,8 @@ class GraspNetDataset(Dataset):
         <= fric_coef_thresh.
 
         Returns:
-            quality:   [M, N]  1.1 - lowest friction of the point's grasps,
-                               0 where the point has no grasp
+            quality:   [M, N]  number of valid grasps of the point, log-scaled
+                               to [0, 1] (quality_from_counts), 0 = no grasp
             point_idx: [T]     m * N + n of each grasp
             rotation:  [T, 6]  6D rotation, camera frame
             width:     [T]     gripper width (m)
@@ -597,10 +615,9 @@ class GraspNetDataset(Dataset):
             if len(g_idx) == 0:
                 continue
 
-            best_fric = np.full(N, np.inf, dtype=np.float32)
-            np.minimum.at(best_fric, n_rep, fric)
-            has = np.isfinite(best_fric)
-            quality[m, has] = 1.1 - best_fric[has]  # graspnetAPI score
+            counts = np.bincount(n_rep, minlength=N)  # valid grasps per point
+            has    = counts > 0
+            quality[m, has] = quality_from_counts(counts[has])
 
             # step 3 of loadGrasp, then into this camera view
             R = batch_viewpoint_params_to_matrix(

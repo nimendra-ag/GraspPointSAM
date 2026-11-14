@@ -47,15 +47,15 @@ training:
   num_points: 10000
   learning_rate: 3.0e-4        # confirmed from official large.yaml
   weight_decay: 0.1            # confirmed from official large.yaml
-  max_epochs: 20               # final length; LR decays fully by epoch 20
+  max_epochs: 30               # final length; LR decays fully by epoch 30
   max_grad_value: 1.0          # confirmed from official large.yaml
   gradient_accumulation_steps: 1
   mixed_precision: "fp16"      # essential for memory efficiency
   gradient_checkpointing: true
   output_dir: "checkpoints"
   log_every_n_steps: 10
-  val_every_n_epochs: 10       # validate after epochs 10 and 20
-  save_freq: 5                 # checkpoint after epochs 5, 10, 15, 20
+  val_every_n_epochs: 10       # validate after epochs 10, 20, 30
+  save_freq: 1                 # checkpoint after every epoch (server crashed once)
 
   scheduler:
     milestones: [400000, 500000]  # confirmed from official large.yaml

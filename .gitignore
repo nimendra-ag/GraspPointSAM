@@ -10,3 +10,7 @@ data-rgbdmatter/
 **.safetensors
 eval_results/
 model-graspsam/
+
+# simulation
+sim_assets/
+sim_results/

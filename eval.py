@@ -179,7 +179,18 @@ def predict_frame(model, args, root: Path, scene_id: int, camera: str,
     if args.workspace_crop:
         keep = workspace_mask(root, scene_id, camera, ann_id, coords, seg_flat)
         coords, colors, seg_flat = coords[keep], colors[keep], seg_flat[keep]
+    return predict_grasps(model, args, coords, colors, seg_flat, device)
 
+
+@torch.no_grad()
+def predict_grasps(model, args, coords: np.ndarray, colors: np.ndarray,
+                   seg_flat: np.ndarray, device: str) -> np.ndarray:
+    """
+    Camera-frame points -> [G, 17] graspnetAPI grasp array (after NMS).
+
+    coords [N, 3] m, colors [N, 3] in [0, 1], seg_flat [N] (obj_id + 1, 0 = background).
+    One prompt per object, from seg_flat. Also used by sim_grasp.py.
+    """
     idx = sample_indices(coords, args.num_points, args.sampling, args.voxel_size)
     coords, colors, seg_flat = coords[idx], colors[idx], seg_flat[idx]
 
